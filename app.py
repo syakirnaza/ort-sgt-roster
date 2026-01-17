@@ -15,18 +15,15 @@ def load_all_data(sheet_id):
         leave_df = pd.read_csv(get_sheet_url(sheet_id, "LeaveRequest"))
         config_df = pd.read_csv(get_sheet_url(sheet_id, "Configuration"))
         
-        # Safety: Clean all headers and force common names
+        # Clean headers & print for debugging
         for df in [staff_df, leave_df, config_df]:
-            df.columns = df.columns.str.strip()
-            # If user typed 'Month Year' instead of 'Month_Year', fix it
-            df.rename(columns={'Month Year': 'Month_Year', 'month_year': 'Month_Year'}, inplace=True)
+            df.columns = df.columns.str.strip().str.replace(' ', '_')
             
         def parse_med_date(date_str):
             if pd.isna(date_str) or str(date_str).strip() == "": return None
             try:
-                # Handles Jan_1_2026 format
-                clean_str = str(date_str).replace('_', ' ')
-                return pd.to_datetime(clean_str).date()
+                # Normalizes Jan_1_2026 format
+                return pd.to_datetime(str(date_str).replace('_', ' ')).date()
             except:
                 return None
 
@@ -41,22 +38,25 @@ def generate_medical_roster(month, year, staff_df, leave_df, config_df):
     num_days = calendar.monthrange(year, month)[1]
     days = [date(year, month, d) for d in range(1, num_days + 1)]
     
-    # 1. Get the month string (e.g., 'Jan_2026')
+    # 1. Targeted Month Filtering
     current_month_str = f"{calendar.month_name[month][:3]}_{year}" 
     
-    # 2. Safely find the Configuration for this month
+    # Logic to handle missing Month_Year column safely
     if 'Month_Year' in config_df.columns:
         month_config = config_df[config_df['Month_Year'] == current_month_str]
     else:
-        # If column is missing, use the whole config table as a fallback
-        st.warning("Column 'Month_Year' not found in Config. Using all dates.")
+        st.sidebar.warning(f"Header 'Month_Year' not found. Available: {list(config_df.columns)}")
         month_config = config_df
     
-    # Get PH day numbers (1, 14, 29...)
-    ph_days = []
-    if 'PH_Dates' in month_config.columns:
-        # Convert to numeric, errors='coerce' turns text into NaN, then dropna
-        ph_days = pd.to_numeric(month_config['PH_Dates'], errors='coerce').dropna().astype(int).tolist()
+    # 2. Extract PH and OT Day Numbers
+    def get_days_from_col(col_name):
+        if col_name in month_config.columns:
+            return pd.to_numeric(month_config[col_name], errors='coerce').dropna().astype(int).tolist()
+        return []
+
+    ph_days = get_days_from_col('PH_Dates')
+    elot_days = get_days_from_col('ELOT_Dates')
+    minor_ot_days = get_days_from_col('Minor_OT_Dates')
     
     all_staff = staff_df['Staff Name'].dropna().tolist()
     roster_output = []
@@ -71,9 +71,7 @@ def generate_medical_roster(month, year, staff_df, leave_df, config_df):
         
         # Filter availability
         daily_leave = leave_df[leave_df['Date'] == day]
-        # Check 'Name' column in LeaveRequest
         staff_absent = daily_leave['Name'].tolist() if 'Name' in daily_leave.columns else []
-        # Check 'Oncall' column for 'No'
         staff_no_oncall = []
         if 'Oncall' in daily_leave.columns:
             staff_no_oncall = daily_leave[daily_leave['Oncall'] == 'No']['Name'].tolist()
@@ -83,8 +81,8 @@ def generate_medical_roster(month, year, staff_df, leave_df, config_df):
         row = {
             "Date": day, "Day": day.strftime("%A"),
             "Type": "Holiday/Weekend" if is_special else "Weekday",
-            "Oncall 1": "SHORTAGE", "Oncall 2": "SHORTAGE", "Oncall 3": "",
-            "Passive": "", "ELOT 1": "", "ELOT 2": "", "Minor OT 1": "", "Minor OT 2": ""
+            "Oncall_1": "SHORTAGE", "Oncall_2": "SHORTAGE", "Oncall_3": "",
+            "Passive": "", "ELOT_1": "", "ELOT_2": "", "Minor_OT_1": "", "Minor_OT_2": ""
         }
 
         if len(available) >= 2:
@@ -99,14 +97,19 @@ def generate_medical_roster(month, year, staff_df, leave_df, config_df):
                 pool = available
 
             if len(pool) >= 2:
-                row["Oncall 1"], row["Oncall 2"] = pool[0], pool[1]
+                row["Oncall_1"], row["Oncall_2"] = pool[0], pool[1]
             if is_special and len(pool) >= 3:
-                row["Oncall 3"] = pool[2]
-            if is_special and len(pool) >= 7:
-                row["ELOT 1"], row["ELOT 2"] = pool[3], pool[4]
-                row["Minor OT 1"], row["Minor OT 2"] = pool[5], pool[6]
+                row["Oncall_3"] = pool[2]
+            
+            # Specific OT Logic based on your Config Tab numbers
+            if d_num in elot_days or is_special:
+                if len(pool) >= 5:
+                    row["ELOT_1"], row["ELOT_2"] = pool[3], pool[4]
+            if d_num in minor_ot_days or is_special:
+                if len(pool) >= 7:
+                    row["Minor_OT_1"], row["Minor_OT_2"] = pool[5], pool[6]
 
-        # Passive distribution
+        # Passive distribution (Equal for everyone)
         avail_passive = [s for s in all_staff if s not in staff_absent]
         if avail_passive:
             row["Passive"] = avail_passive[passive_idx % len(avail_passive)]
@@ -130,3 +133,8 @@ if staff is not None:
     if st.button("Generate Roster"):
         df = generate_medical_roster(m_idx, 2026, staff, leave, config)
         st.dataframe(df, use_container_width=True)
+        
+        # Fairness Summary
+        st.subheader("📊 Workload Summary")
+        summary = df['Oncall_1'].value_counts().add(df['Oncall_2'].value_counts(), fill_value=0)
+        st.bar_chart(summary)
