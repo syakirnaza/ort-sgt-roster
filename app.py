@@ -1,166 +1,51 @@
 import streamlit as st
 import pandas as pd
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 
-# --- DEBUG: CHECK IF SECRETS EXIST ---
-if "connections" not in st.secrets or "gsheets" not in st.secrets["connections"]:
-    st.error("Secrets are not configured correctly. Check your [connections.gsheets] header in Streamlit settings.")
-    st.stop()
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Medical Roster 2026", layout="wide")
 
-# --- 1. CONNECTION SETUP ---
-def get_data_from_google(sheet_id, range_name):
-    # This matches the Secrets structure above
-    creds_info = st.secrets["connections"]["gsheets"]
-    creds = service_account.Credentials.from_service_account_info(creds_info)
-    service = build('sheets', 'v4', credentials=creds)
+# Replace this with your actual Google Sheet ID
+# It's the long string in your URL: /d/1pR3rsSXa9eUmdSylt8_U6_7TEYv7ujk1JisexuB1GUY/edit
+SHEET_ID = "1pR3rsSXa9eUmdSylt8_U6_7TEYv7ujk1JisexuB1GUY"
+
+# Helper function to generate CSV export URLs for specific tabs
+def get_sheet_url(sheet_id, sheet_name):
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+
+@st.cache_data(ttl=60)
+def load_all_data():
+    try:
+        # We fetch each tab by its name
+        staff_df = pd.read_csv(get_sheet_url(SHEET_ID, "StaffList"))
+        config_df = pd.read_csv(get_sheet_url(SHEET_ID, "Configuration"))
+        leave_df = pd.read_csv(get_sheet_url(SHEET_ID, "LeaveRequest"))
+        return staff_df, config_df, leave_df
+    except Exception as e:
+        st.error(f"Error loading data: {e}")
+        return None, None, None
+
+# --- MAIN APP ---
+st.title("🏥 Medical Roster System")
+
+staff, config, leave = load_all_data()
+
+if staff is not None:
+    st.success("✅ Successfully connected via Public Link!")
     
-    sheet = service.spreadsheets()
-    result = sheet.values().get(spreadsheetId=sheet_id, range=range_name).execute()
-    values = result.get('values', [])
-    
-    if not values:
-        return pd.DataFrame()
-    return pd.DataFrame(values[1:], columns=values[0])
+    # Sidebar for Navigation
+    page = st.sidebar.selectbox("Navigate", ["Staff List", "Roster Generator", "Leave Overview"])
 
-# --- 2. EXECUTION ---
+    if page == "Staff List":
+        st.subheader("Current Staffing")
+        st.dataframe(staff, use_container_width=True)
+        
+    elif page == "Roster Generator":
+        st.subheader("Generate Monthly Roster")
+        # Your roster logic goes here...
+        st.info("Logic processing for 2026 dates...")
 
-# First, let's check if the secret keys actually exist before we try to use them
-if "connections" not in st.secrets:
-    st.error("❌ 'connections' section missing in Secrets.")
-    st.stop()
-if "gsheets" not in st.secrets["connections"]:
-    st.error("❌ 'gsheets' section missing under connections.")
-    st.stop()
-if "spreadsheet_id" not in st.secrets["connections"]["gsheets"]:
-    st.error("❌ 'spreadsheet_id' key is missing inside gsheets secrets.")
-    st.stop()
-
-# If we pass the checks, then assign the ID
-SHEET_ID = st.secrets["connections"]["gsheets"]["spreadsheet_id"]
-
-try:
-    # Attempt to pull the data
-    staff_df = get_data_from_google(SHEET_ID, "StaffList!A:Z")
-    
-    if not staff_df.empty:
-        st.success("✅ Successfully connected to Google Sheets!")
-        st.subheader("Preview of Staff List")
-        st.dataframe(staff_df.head())
-    else:
-        st.warning("Connected, but the StaffList sheet seems to be empty.")
-
-except Exception as e:
-    st.error(f"⚠️ Connection Error: {e}")
-    st.info("Check: Is the Service Account email added as an 'Editor' on the Google Sheet?")
-
-# --- 2. LOAD DATA ---
-# Replace this with your actual Sheet ID from the URL
-SHEET_ID = st.secrets["connections"]["gsheets"]["spreadsheet_id"]
-
-try:
-    staff_df = get_data_from_google(SHEET_ID, "StaffList!A:Z")
-    config_df = get_data_from_google(SHEET_ID, "Configuration!A:Z")
-    leave_df = get_data_from_google(SHEET_ID, "LeaveRequest!A:Z")
-    st.success("Connected via Official Google API!")
-except Exception as e:
-    st.error(f"Connection failed: {e}")
-    st.stop()
-
-# --- 2. SIDEBAR NAVIGATION ---
-st.sidebar.title("📅 Roster Control")
-selected_year = st.sidebar.selectbox("Year", [2025, 2026, 2027], index=1)
-selected_month_name = st.sidebar.selectbox("Month", calendar.month_name[1:])
-selected_month_num = list(calendar.month_name).index(selected_month_name)
-
-# Dynamic Calendar Logic
-num_days = calendar.monthrange(selected_year, selected_month_num)[1]
-dates = pd.date_range(start=f"{selected_year}-{selected_month_num:02d}-01", periods=num_days)
-
-# --- 3. EXTRACT MONTHLY SETTINGS ---
-month_key = f"{selected_month_name}_{selected_year}"
-month_config = config_df[config_df['Month_Year'] == month_key]
-
-if not month_config.empty:
-    def parse_dates(val):
-        if pd.isna(val) or val == "": return []
-        return [int(x.strip()) for x in str(val).split(',') if x.strip().isdigit()]
-    
-    ph_dates = parse_dates(month_config.iloc[0]['PH_Dates'])
-    elot_dates = parse_dates(month_config.iloc[0]['ELOT_Dates'])
-    minor_dates = parse_dates(month_config.iloc[0]['Minor_OT_Dates'])
+    elif page == "Leave Overview":
+        st.subheader("Leave Requests")
+        st.write(leave)
 else:
-    ph_dates, elot_dates, minor_dates = [], [], []
-
-# --- 4. ROSTER GENERATION LOGIC ---
-def generate_roster():
-    df = pd.DataFrame({"Date": dates.day, "Day": dates.day_name()})
-    
-    # Your specified headers
-    columns = ["1st call", "2nd call", "3rd call", "Passive", "ELOT 1", "ELOT 2", "Minor OT 1", "Minor OT 2", "Wound Clinic"]
-    for col in columns: df[col] = "-"
-
-    # Simplified Assignment Logic
-    for i in range(len(df)):
-        d_num = df.loc[i, "Date"]
-        d_name = df.loc[i, "Day"]
-        date_key = f"{selected_month_name[:3]}_{d_num}_{selected_year}" # e.g. Jan_1_2026
-        
-        # Get Leave for this specific day
-        daily_leave = leave_df[leave_df['Date_Key'] == date_key]
-        staff_on_leave = []
-        no_oncall = []
-        
-        if not daily_leave.empty:
-            staff_on_leave = [x.strip() for x in str(daily_leave.iloc[0]['Staff_on_Leave']).split(',') if x.strip()]
-            no_oncall = [x.strip() for x in str(daily_leave.iloc[0]['No_Oncall_Staff']).split(',') if x.strip()]
-
-        # Filling slots based on your staff_df permissions
-        assigned_today = []
-        
-        for col in columns:
-            # Special logic: Only fill ELOT/Minor OT if date is in config
-            if "ELOT" in col and d_num not in elot_dates: continue
-            if "Minor OT" in col and d_num not in minor_dates: continue
-            if col == "3rd call" and (d_name not in ['Saturday', 'Sunday'] and d_num not in ph_dates): continue
-
-            # Filter staff who: 1. Can do the role, 2. Not on leave, 3. Not assigned today
-            eligible = staff_df[
-                (staff_df[col] == "Yes") & 
-                (~staff_df['Staff Name'].isin(staff_on_leave)) &
-                (~staff_df['Staff Name'].isin(assigned_today))
-            ]
-            
-            # Additional check for No_Oncall_Staff (Restrictions)
-            if "call" in col.lower() or "Passive" in col:
-                eligible = eligible[~eligible['Staff Name'].isin(no_oncall)]
-
-            if not eligible.empty:
-                chosen = eligible.sample(1).iloc[0]['Staff Name']
-                df.at[i, col] = chosen
-                assigned_today.append(chosen)
-
-    return df
-
-# --- 5. DISPLAY ---
-st.title(f"🏥 Medical Roster: {selected_month_name} {selected_year}")
-
-tab1, tab2 = st.tabs(["📅 View Roster", "👥 Staff Permissions"])
-
-with tab1:
-    if st.button("🔄 Regenerate Roster"):
-        st.cache_data.clear()
-        
-    final_df = generate_roster()
-    
-    # Styling for PH and Weekends (Green)
-    def style_row(row):
-        if row.Day in ['Saturday', 'Sunday'] or row.Date in ph_dates:
-            return ['background-color: #d1f2eb; color: black; border: 1px solid #7fb3d5; font-weight: bold;'] * len(row)
-        return [''] * len(row)
-
-    st.dataframe(final_df.style.apply(style_row, axis=1), height=800, use_container_width=True)
-
-with tab2:
-    st.subheader("Current Staff Permissions (from StaffList)")
-    st.dataframe(staff_df, use_container_width=True)
+    st.warning("Please ensure your Google Sheet is set to 'Anyone with the link can view'.")
