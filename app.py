@@ -18,10 +18,10 @@ def load_all_data(sheet_id):
         leave_df['Date'] = pd.to_datetime(leave_df['Date'].astype(str).str.replace('_', ' ')).dt.date
         return staff_df, leave_df.dropna(subset=['Date']), config_df
     except Exception as e:
-        st.error(f"Error loading data: {e}")
+        st.error(f"Data Load Error: {e}")
         return None, None, None
 
-# --- 2. THE IMPROVED SIMULATION ENGINE ---
+# --- 2. THE ENGINE ---
 def run_simulation(month_idx, year, staff_df, leave_df, config_df):
     num_days = calendar.monthrange(year, month_idx)[1]
     days = [date(year, month_idx, d) for d in range(1, num_days + 1)]
@@ -37,14 +37,14 @@ def run_simulation(month_idx, year, staff_df, leave_df, config_df):
     ph_days, elot_days, minor_days, wound_days = get_conf(1), get_conf(2), get_conf(3), get_conf(4)
     all_staff = staff_df['Staff Name'].dropna().tolist()
     
-    # Mapping pools directly to column names to avoid index errors
+    # Static Pool Extraction
+    def find_col(name):
+        matches = [c for c in staff_df.columns if name.lower() in c.lower()]
+        return staff_df[matches[0]].dropna().tolist() if matches else all_staff
+
     pools = {
-        "o1": staff_df[staff_df.columns[staff_df.columns.str.contains('1st call', case=False)]].iloc[:,0].dropna().tolist(),
-        "o2": staff_df[staff_df.columns[staff_df.columns.str.contains('2nd call', case=False)]].iloc[:,0].dropna().tolist(),
-        "o3": staff_df[staff_df.columns[staff_df.columns.str.contains('3rd call', case=False)]].iloc[:,0].dropna().tolist(),
-        "elot": staff_df[staff_df.columns[staff_df.columns.str.contains('ELOT 1', case=False)]].iloc[:,0].dropna().tolist(),
-        "minor": staff_df[staff_df.columns[staff_df.columns.str.contains('Minor OT 1', case=False)]].iloc[:,0].dropna().tolist(),
-        "wound": staff_df[staff_df.columns[staff_df.columns.str.contains('Wound Clinic', case=False)]].iloc[:,0].dropna().tolist()
+        "o1": find_col("1st call"), "o2": find_col("2nd call"), "o3": find_col("3rd call"),
+        "elot": find_col("ELOT 1"), "minor": find_col("Minor OT 1"), "wound": find_col("Wound Clinic")
     }
 
     roster, total_penalties = [], 0
@@ -67,46 +67,45 @@ def run_simulation(month_idx, year, staff_df, leave_df, config_df):
         occupied_today = set()
 
         def get_avail(pool, duty_type):
-            pool = [s for s in pool if s not in absent]
+            res = [s for s in pool if s not in absent and s not in occupied_today]
             if duty_type in ["oncall", "passive", "elot"]:
-                pool = [s for s in pool if s not in restricted]
-            pool = [s for s in pool if s not in occupied_today]
-            if duty_type == "elot" and day.weekday() != 5: # Post-call rule for ELOT
-                pool = [s for s in pool if s not in prev_day_oncalls]
-            return pool
+                res = [s for s in res if s not in restricted]
+            if duty_type == "elot" and not is_sat:
+                res = [s for s in res if s not in prev_day_oncalls]
+            return res
 
         row = {"Date": day, "Day": day.strftime("%A"), "Is_Spec": is_spec,
                "Oncall 1": "", "Oncall 2": "", "Oncall 3": "", "Passive": "", 
                "ELOT 1": "", "ELOT 2": "", "Minor OT 1": "", "Minor OT 2": "", "Wound Clinic": ""}
 
-        # --- WEEKEND GROUP LOGIC ---
+        # --- WEEKEND TEAM LOGIC ---
         if is_sun and len(weekend_group) == 3:
-            # Re-use Saturday group but rotate roles
-            random.shuffle(weekend_group)
-            # Ensure O1 today is not O1 yesterday
-            if weekend_group[0] == roster[-1]["Oncall 1"]:
-                weekend_group[0], weekend_group[1] = weekend_group[1], weekend_group[0]
+            # Shift Sunday from Saturday's Team
+            sun_team = weekend_group.copy()
+            random.shuffle(sun_team)
+            # Ensure O1 rotation
+            if sun_team[0] == roster[-1]["Oncall 1"]:
+                sun_team[0], sun_team[1] = sun_team[1], sun_team[0]
             
-            for i, call_key in enumerate(["Oncall 1", "Oncall 2", "Oncall 3"]):
-                p = weekend_group[i]
+            for i, c_key in enumerate(["Oncall 1", "Oncall 2", "Oncall 3"]):
+                p = sun_team[i]
                 if p not in absent and p not in restricted:
-                    row[call_key] = p
+                    row[c_key] = p
                     occupied_today.add(p)
-                else: total_penalties += 2000 # Leave broke group continuity
+                else: total_penalties += 2000 # Critical: Leave broke continuity
         else:
             if is_sat: weekend_group = []
-            # Standard Assignment for Weekdays/Saturday/PH
-            for call_key, pool_key in [("Oncall 1", "o1"), ("Oncall 2", "o2"), ("Oncall 3", "o3")]:
-                if call_key == "Oncall 3" and not is_spec: continue
-                a = get_avail(pools[pool_key], "oncall")
+            for c_key, p_key in [("Oncall 1", "o1"), ("Oncall 2", "o2"), ("Oncall 3", "o3")]:
+                if c_key == "Oncall 3" and not is_spec: continue
+                a = get_avail(pools[p_key], "oncall")
                 if a:
                     pick = random.choice(a)
-                    row[call_key] = pick
+                    row[c_key] = pick
                     occupied_today.add(pick)
                     if is_sat: weekend_group.append(pick)
                 else: total_penalties += 5000
 
-        # --- ELOT, MINOR, WOUND ---
+        # --- OTHER SLOTS ---
         if d_num in elot_days:
             ae = get_avail(pools["elot"], "elot")
             if is_sat and ae: row["ELOT 1"] = random.choice(ae)
@@ -120,38 +119,36 @@ def run_simulation(month_idx, year, staff_df, leave_df, config_df):
             aw = get_avail(pools["wound"], "wound")
             if aw: row["Wound Clinic"] = random.choice(aw)
 
-        # --- PASSIVE ---
+        # Passive
         ap = get_avail(all_staff, "passive")
         if ap:
             row["Passive"] = ap[passive_idx % len(ap)]
             passive_idx += 1
-            occupied_today.add(row["Passive"])
 
         prev_day_oncalls = {row["Oncall 1"], row["Oncall 2"], row["Oncall 3"]}
         roster.append(row)
 
-    # --- SCORING FOR EQUALITY ---
+    # --- EQUALITY SCORE ---
     df = pd.DataFrame(roster)
-    all_oncalls = pd.concat([df["Oncall 1"], df["Oncall 2"], df["Oncall 3"]]).value_counts().reindex(all_staff, fill_value=0)
-    spec_oncalls = pd.concat([df[df["Is_Spec"]==True][c] for c in ["Oncall 1", "Oncall 2", "Oncall 3"]]).value_counts().reindex(all_staff, fill_value=0)
-    
-    score = total_penalties + (np.std(all_oncalls) * 150) + (np.std(spec_oncalls) * 300)
+    all_o = pd.concat([df["Oncall 1"], df["Oncall 2"], df["Oncall 3"]]).value_counts().reindex(all_staff, fill_value=0)
+    spec_o = pd.concat([df[df["Is_Spec"]][c] for c in ["Oncall 1","Oncall 2","Oncall 3"]]).value_counts().reindex(all_staff, fill_value=0)
+    score = total_penalties + (np.std(all_o)*150) + (np.std(spec_o)*400)
     return df, score
 
-# --- 3. OPTIMIZER WRAPPER ---
-def optimize_roster(m_idx, year, staff, leave, config, iterations):
+# --- 3. OPTIMIZER ---
+def optimize(m_idx, year, staff, leave, config, iters):
     best_df, best_score = None, float('inf')
     bar = st.progress(0)
-    for i in range(1, iterations + 1):
+    for i in range(1, iters + 1):
         df, score = run_simulation(m_idx, year, staff, leave, config)
         if score < best_score:
             best_score, best_df = score, df
-        if i % 500 == 0: bar.progress(i/iterations)
+        if i % 500 == 0: bar.progress(i/iters)
     return best_df
 
 # --- 4. UI ---
-st.set_page_config(page_title="Safe Roster Optimizer", layout="wide")
-st.title("🏥 Medical Roster: Group Continuity & Absolute Safety")
+st.set_page_config(page_title="Final HPC Roster", layout="wide")
+st.title("🏥 Medical Roster: Final Verified Engine")
 
 SHEET_ID = "1pR3rsSXa9eUmdSylt8_U6_7TEYv7ujk1JisexuB1GUY"
 staff, leave, config = load_all_data(SHEET_ID)
@@ -161,14 +158,15 @@ if staff is not None:
     m_idx = list(calendar.month_name).index(m_name)
     sims = st.sidebar.select_slider("Intensity", options=[1000, 10000, 50000], value=10000)
 
-    if st.button("Generate Optimized Roster"):
-        final_df = optimize_roster(m_idx, 2026, staff, leave, config, sims)
+    if st.button("Generate Final Optimized Roster"):
+        final_df = optimize(m_idx, 2026, staff, leave, config, sims)
         st.dataframe(final_df.drop(columns=["Is_Spec"]), use_container_width=True)
         
-        # Summary Audit
-        summary = []
-        for name in staff['Staff Name'].dropna().unique():
-            o_tot = (final_df["Oncall 1"]==name).sum() + (final_df["Oncall 2"]==name).sum() + (final_df["Oncall 3"]==name).sum()
-            w_tot = (final_df[final_df["Is_Spec"]==True][["Oncall 1","Oncall 2","Oncall 3"]]==name).sum().sum()
-            summary.append({"Name": name, "Total Oncall": o_tot, "Weekend/PH": w_tot})
-        st.table(pd.DataFrame(summary))
+        # Final Audit Table
+        st.subheader("📊 Equality Audit")
+        audit = []
+        for n in staff['Staff Name'].dropna().unique():
+            o_t = (final_df[["Oncall 1","Oncall 2","Oncall 3"]]==n).sum().sum()
+            w_t = (final_df[final_df["Is_Spec"]==True][["Oncall 1","Oncall 2","Oncall 3"]]==n).sum().sum()
+            audit.append({"Staff Name": n, "Total Oncalls": o_t, "Weekend/PH": w_t})
+        st.table(pd.DataFrame(audit))
