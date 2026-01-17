@@ -5,7 +5,7 @@ import random
 import numpy as np
 from datetime import date, timedelta
 
-# --- 1. DATA LOADING ENGINE ---
+# --- 1. DATA LOADING ENGINE (UNCHANGED) ---
 @st.cache_data(ttl=60)
 def load_all_data(sheet_id):
     def get_url(name): return f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={name}"
@@ -22,7 +22,7 @@ def load_all_data(sheet_id):
         st.error(f"Error connecting to Google Sheets: {e}")
         return None, None, None
 
-# --- 2. SINGLE ROSTER GENERATION LOGIC ---
+# --- 2. SINGLE ROSTER GENERATION LOGIC (UPDATED FOR SAFETY) ---
 def run_simulation(month_idx, year, staff_df, leave_df, config_df):
     num_days = calendar.monthrange(year, month_idx)[1]
     days = [date(year, month_idx, d) for d in range(1, num_days + 1)]
@@ -45,8 +45,11 @@ def run_simulation(month_idx, year, staff_df, leave_df, config_df):
 
     roster, total_penalties = [], 0
     passive_idx = random.randint(0, 100)
-    sat_assignments = {"o1": None, "o2": None, "o3": None}
-    post_call_shield = set() # Doctors who did Oncall yesterday
+    
+    # Trackers for Weekend Continuity
+    weekend_team = [] 
+    prev_sat_o1 = None
+    post_call_shield = set()
 
     for day in days:
         d_num = day.day
@@ -60,84 +63,100 @@ def run_simulation(month_idx, year, staff_df, leave_df, config_df):
             absent = [n.strip() for n in str(leave_row.iloc[0, 3]).split(',')] if str(leave_row.iloc[0, 3]) != 'nan' else []
             restricted = [n.strip() for n in str(leave_row.iloc[0, 4]).split(',')] if str(leave_row.iloc[0, 4]) != 'nan' else []
 
-        # Current day's occupied staff (for same-day conflicts)
-        daily_oncall_staff = set()
-
-        def get_avail(pool, duty_type):
-            pool = [s for s in pool if s not in absent]
-            # Strict Restriction: Col E excluded from Oncalls, Passive, and ELOT
-            if duty_type in ["oncall", "passive", "elot"]:
-                pool = [s for s in pool if s not in restricted]
-            
-            # SAME-DAY BLOCK: Cannot do ELOT if doing Oncall today
-            if duty_type == "elot":
-                pool = [s for s in pool if s not in daily_oncall_staff]
-                # NEXT-DAY BLOCK: Cannot do ELOT if did Oncall yesterday
-                pool = [s for s in pool if s not in post_call_shield]
-            return pool
-
+        # RESET trackers for the day
+        daily_occupied = set()
         row = {"Date": day, "Day": day.strftime("%A"), "Is_Spec": is_spec,
                "Oncall 1": "", "Oncall 2": "", "Oncall 3": "", "Passive": "", 
                "ELOT 1": "", "ELOT 2": "", "Minor OT 1": "", "Minor OT 2": "", "Wound Clinic": ""}
 
-        # --- Oncall Assignments ---
-        for call_type in ["o1", "o2"]:
-            a = get_avail(pools[call_type], "oncall")
-            if a:
-                if call_type == "o1" and is_sun:
-                    eligible = [s for s in a if s != sat_assignments["o1"]]
-                    row["Oncall 1"] = random.choice(eligible) if eligible else random.choice(a)
-                    if not eligible: total_penalties += 1000
-                else:
-                    row[f"Oncall {call_type[1]}"] = random.choice(a)
+        def get_avail(pool, duty_type):
+            # Base availability: Not on leave and not already picked for another role today
+            res = [s for s in pool if s not in absent and s not in daily_occupied]
+            if duty_type in ["oncall", "passive", "elot"]:
+                res = [s for s in res if s not in restricted]
+            if duty_type == "elot":
+                res = [s for s in res if s not in post_call_shield]
+            return res
+
+        # --- ONCALL LOGIC (The Core Fix) ---
+        if is_sun and len(weekend_team) == 3:
+            # SUNDAY: Mandatory reuse of Saturday's team
+            sun_pool = [s for s in weekend_team if s not in absent and s not in restricted]
+            if len(sun_pool) < 3:
+                total_penalties += 2000 # Leave broke the weekend group
+                sun_pool = get_avail(pools["o1"], "oncall") # Emergency fallback
+            
+            random.shuffle(sun_pool)
+            # Rotation Rule: Sunday O1 must be different from Saturday O1
+            if sun_pool[0] == prev_sat_o1 and len(sun_pool) > 1:
+                sun_pool[0], sun_pool[1] = sun_pool[1], sun_pool[0]
+            
+            for i, call in enumerate(["Oncall 1", "Oncall 2", "Oncall 3"]):
+                if i < len(sun_pool):
+                    row[call] = sun_pool[i]
+                    daily_occupied.add(sun_pool[i])
+        else:
+            # WEEKDAYS, SATURDAY, OR PH: Fresh Selection
+            if is_sat: weekend_team = []
+            
+            for call_key, pool_key in [("Oncall 1", "o1"), ("Oncall 2", "o2"), ("Oncall 3", "o3")]:
+                # Only do Oncall 3 on Specials
+                if call_key == "Oncall 3" and not is_spec: continue
                 
-                daily_oncall_staff.add(row[f"Oncall {call_type[1]}"])
-                if is_sat: sat_assignments[call_type] = row[f"Oncall {call_type[1]}"]
-            else: total_penalties += 5000
+                avail = get_avail(pools[pool_key], "oncall")
+                if avail:
+                    pick = random.choice(avail)
+                    row[call_key] = pick
+                    daily_occupied.add(pick)
+                    if is_sat: 
+                        weekend_team.append(pick)
+                        if call_key == "Oncall 1": prev_sat_o1 = pick
+                else: total_penalties += 5000
 
-        if is_spec:
-            a3 = get_avail(pools["o3"], "oncall")
-            if a3:
-                eligible_o3 = [s for s in a3 if s != sat_assignments["o3"]] if is_sun else a3
-                row["Oncall 3"] = random.choice(eligible_o3) if eligible_o3 else random.choice(a3)
-                daily_oncall_staff.add(row["Oncall 3"])
-                if is_sat: sat_assignments["o3"] = row["Oncall 3"]
-
-        # --- ELOT (Checks Same-Day and Post-Call Blocks) ---
+        # --- ELOT, MINOR, WOUND (Respects daily_occupied) ---
         if d_num in elot_days:
             ae = get_avail(pools["elot"], "elot")
-            if is_sat and ae: row["ELOT 1"] = random.choice(ae)
-            elif len(ae) >= 2: row["ELOT 1"], row["ELOT 2"] = random.sample(ae, 2)
-            elif len(ae) == 1: row["ELOT 1"] = ae[0]
+            if is_sat and ae: 
+                row["ELOT 1"] = random.choice(ae)
+                daily_occupied.add(row["ELOT 1"])
+            elif len(ae) >= 2:
+                picks = random.sample(ae, 2)
+                row["ELOT 1"], row["ELOT 2"] = picks[0], picks[1]
+                daily_occupied.update(picks)
 
-        # --- Minor OT & Wound Clinic ---
         if d_num in minor_days:
             am = get_avail(pools["minor"], "minor_ot")
-            if len(am) >= 2: row["Minor OT 1"], row["Minor OT 2"] = random.sample(am, 2)
+            if len(am) >= 2:
+                picks = random.sample(am, 2)
+                row["Minor OT 1"], row["Minor OT 2"] = picks[0], picks[1]
+                daily_occupied.update(picks)
+
         if d_num in wound_days:
             aw = get_avail(pools["wound"], "wound_clinic")
-            if aw: row["Wound Clinic"] = random.choice(aw)
+            if aw: 
+                row["Wound Clinic"] = random.choice(aw)
+                daily_occupied.add(row["Wound Clinic"])
 
         # --- Passive ---
         ap = get_avail(all_staff, "passive")
         if ap:
             row["Passive"] = ap[passive_idx % len(ap)]
             passive_idx += 1
-        
-        # Prepare Post-Call Shield for TOMORROW
-        post_call_shield = daily_oncall_staff.copy()
+            daily_occupied.add(row["Passive"])
+
+        post_call_shield = {row["Oncall 1"], row["Oncall 2"], row["Oncall 3"]} - {""}
         roster.append(row)
 
     # --- EQUALITY SCORING ---
     df = pd.DataFrame(roster)
-    spec_df = df[df["Is_Spec"] == True]
+    spec_df = df[df["Is_Spec"]]
     weekend_counts = pd.concat([spec_df["Oncall 1"], spec_df["Oncall 2"], spec_df["Oncall 3"]]).value_counts().reindex(all_staff, fill_value=0)
     total_counts = pd.concat([df["Oncall 1"], df["Oncall 2"], df["Oncall 3"]]).value_counts().reindex(all_staff, fill_value=0)
     
     total_score = total_penalties + (np.std(weekend_counts) * 200) + (np.std(total_counts) * 150)
     return df, total_score
 
-# --- 3. OPTIMIZER & UI ---
+# --- 3. OPTIMIZER & UI (UNCHANGED) ---
 def optimize_roster(m_idx, year, staff, leave, config, iterations):
     best_df, best_score = None, float('inf')
     bar = st.progress(0)
