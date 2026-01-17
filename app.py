@@ -1,24 +1,28 @@
 import streamlit as st
 import pandas as pd
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-import calendar
+from st_gsheets_connection import GSheetsConnection
 
-# --- 1. SECURE CONNECTION LOGIC ---
-def get_data_from_google(sheet_id, range_name):
-    # Pull credentials from Streamlit Secrets
-    creds_dict = st.secrets["connections"]["gsheets"]
-    creds = service_account.Credentials.from_service_account_info(creds_dict)
-    service = build('sheets', 'v4', credentials=creds)
-    
-    # Call the Sheets API
-    sheet = service.spreadsheets()
-    result = sheet.values().get(spreadsheetId=sheet_id, range=range_name).execute()
-    values = result.get('values', [])
-    
-    if not values:
-        return pd.DataFrame()
-    return pd.DataFrame(values[1:], columns=values[0])
+# 1. Access the Spreadsheet ID from secrets
+# Ensure your secrets has: spreadsheet = "https://docs.google.com/..."
+spreadsheet_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
+
+# 2. Establish the connection
+conn = st.connection("gsheets", type=GSheetsConnection)
+
+# 3. Load the data using the connection
+@st.cache_data(ttl=600)
+def load_all_data():
+    staff = conn.read(worksheet="StaffList")
+    config = conn.read(worksheet="Configuration")
+    leave = conn.read(worksheet="LeaveRequest")
+    return staff, config, leave
+
+try:
+    staff_df, config_df, leave_df = load_all_data()
+    st.success("Successfully connected to Google Sheets!")
+except Exception as e:
+    st.error(f"Connection failed: {e}")
+    st.info("Check if your Secret has the full URL under 'spreadsheet' and the Service Account email is an Editor.")
 
 # --- 2. LOAD DATA ---
 # Replace this with your actual Sheet ID from the URL
