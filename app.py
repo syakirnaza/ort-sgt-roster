@@ -1,28 +1,29 @@
 import streamlit as st
 import pandas as pd
-from st_gsheets_connection import GSheetsConnection
 
-# 1. Access the Spreadsheet ID from secrets
-# Ensure your secrets has: spreadsheet = "https://docs.google.com/..."
-spreadsheet_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
-
-# 2. Establish the connection
-conn = st.connection("gsheets", type=GSheetsConnection)
-
-# 3. Load the data using the connection
-@st.cache_data(ttl=600)
-def load_all_data():
-    staff = conn.read(worksheet="StaffList")
-    config = conn.read(worksheet="Configuration")
-    leave = conn.read(worksheet="LeaveRequest")
-    return staff, config, leave
-
+# 1. Get the URL from secrets
+# Ensure your secret is: spreadsheet = "https://docs.google.com/spreadsheets/d/YOUR_ID/export?format=csv"
 try:
-    staff_df, config_df, leave_df = load_all_data()
-    st.success("Successfully connected to Google Sheets!")
+    base_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
+    
+    # We append the specific GID for each tab
+    # You find the GID by clicking the tab in your browser and looking at the URL
+    staff_url = f"{base_url}&gid=0"             # Replace 0 with StaffList GID
+    config_url = f"{base_url}&gid=12345678"     # Replace with Configuration GID
+    leave_url = f"{base_url}&gid=87654321"      # Replace with LeaveRequest GID
+
+    @st.cache_data(ttl=600)
+    def load_data(url):
+        return pd.read_csv(url)
+
+    staff_df = load_data(staff_url)
+    config_df = load_data(config_url)
+    leave_df = load_data(leave_url)
+    
+    st.success("Connected to Google Sheets via Direct CSV Stream!")
+
 except Exception as e:
-    st.error(f"Connection failed: {e}")
-    st.info("Check if your Secret has the full URL under 'spreadsheet' and the Service Account email is an Editor.")
+    st.error(f"Error: {e}")
 
 # --- 2. LOAD DATA ---
 # Replace this with your actual Sheet ID from the URL
