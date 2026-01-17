@@ -15,14 +15,16 @@ def load_all_data(sheet_id):
         leave_df = pd.read_csv(get_sheet_url(sheet_id, "LeaveRequest"))
         config_df = pd.read_csv(get_sheet_url(sheet_id, "Configuration"))
         
-        # Standard Clean
+        # Safety: Clean all headers and force common names
         for df in [staff_df, leave_df, config_df]:
             df.columns = df.columns.str.strip()
+            # If user typed 'Month Year' instead of 'Month_Year', fix it
+            df.rename(columns={'Month Year': 'Month_Year', 'month_year': 'Month_Year'}, inplace=True)
             
-        # Parse LeaveRequest dates (Still assumes Jan_1_2026 format)
         def parse_med_date(date_str):
             if pd.isna(date_str) or str(date_str).strip() == "": return None
             try:
+                # Handles Jan_1_2026 format
                 clean_str = str(date_str).replace('_', ' ')
                 return pd.to_datetime(clean_str).date()
             except:
@@ -31,7 +33,7 @@ def load_all_data(sheet_id):
         leave_df['Date'] = leave_df['Date'].apply(parse_med_date)
         return staff_df, leave_df.dropna(subset=['Date']), config_df
     except Exception as e:
-        st.error(f"Data Error: {e}")
+        st.error(f"Data Loading Error: {e}")
         return None, None, None
 
 # --- 2. ROSTER ENGINE ---
@@ -39,12 +41,22 @@ def generate_medical_roster(month, year, staff_df, leave_df, config_df):
     num_days = calendar.monthrange(year, month)[1]
     days = [date(year, month, d) for d in range(1, num_days + 1)]
     
-    # Extract PH day numbers for the selected month/year
-    # Assumes Configuration tab has a Month_Year column like 'Jan_2026'
+    # 1. Get the month string (e.g., 'Jan_2026')
     current_month_str = f"{calendar.month_name[month][:3]}_{year}" 
-    month_config = config_df[config_df['Month_Year'] == current_month_str]
     
-    ph_days = month_config['PH_Dates'].dropna().astype(int).tolist() if 'PH_Dates' in month_config.columns else []
+    # 2. Safely find the Configuration for this month
+    if 'Month_Year' in config_df.columns:
+        month_config = config_df[config_df['Month_Year'] == current_month_str]
+    else:
+        # If column is missing, use the whole config table as a fallback
+        st.warning("Column 'Month_Year' not found in Config. Using all dates.")
+        month_config = config_df
+    
+    # Get PH day numbers (1, 14, 29...)
+    ph_days = []
+    if 'PH_Dates' in month_config.columns:
+        # Convert to numeric, errors='coerce' turns text into NaN, then dropna
+        ph_days = pd.to_numeric(month_config['PH_Dates'], errors='coerce').dropna().astype(int).tolist()
     
     all_staff = staff_df['Staff Name'].dropna().tolist()
     roster_output = []
@@ -59,8 +71,12 @@ def generate_medical_roster(month, year, staff_df, leave_df, config_df):
         
         # Filter availability
         daily_leave = leave_df[leave_df['Date'] == day]
+        # Check 'Name' column in LeaveRequest
         staff_absent = daily_leave['Name'].tolist() if 'Name' in daily_leave.columns else []
-        staff_no_oncall = daily_leave[daily_leave['Oncall'] == 'No']['Name'].tolist() if 'Oncall' in daily_leave.columns else []
+        # Check 'Oncall' column for 'No'
+        staff_no_oncall = []
+        if 'Oncall' in daily_leave.columns:
+            staff_no_oncall = daily_leave[daily_leave['Oncall'] == 'No']['Name'].tolist()
         
         available = [s for s in all_staff if s not in staff_absent and s not in staff_no_oncall]
         
@@ -73,7 +89,6 @@ def generate_medical_roster(month, year, staff_df, leave_df, config_df):
 
         if len(available) >= 2:
             week_num = day.isocalendar()[1]
-            # Hard Rule: Weekend groups must be the same person
             if is_weekend:
                 if week_num not in weekend_groups:
                     random.shuffle(available)
