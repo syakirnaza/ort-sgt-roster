@@ -1,26 +1,36 @@
 import streamlit as st
 import pandas as pd
-from st_gsheets_connection import GSheetsConnection
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 import calendar
-from datetime import datetime
 
-# --- PAGE CONFIG ---
-st.set_page_config(layout="wide", page_title="Medical Roster 2026")
+# --- 1. SECURE CONNECTION LOGIC ---
+def get_data_from_google(sheet_id, range_name):
+    # Pull credentials from Streamlit Secrets
+    creds_dict = st.secrets["connections"]["gsheets"]
+    creds = service_account.Credentials.from_service_account_info(creds_dict)
+    service = build('sheets', 'v4', credentials=creds)
+    
+    # Call the Sheets API
+    sheet = service.spreadsheets()
+    result = sheet.values().get(spreadsheetId=sheet_id, range=range_name).execute()
+    values = result.get('values', [])
+    
+    if not values:
+        return pd.DataFrame()
+    return pd.DataFrame(values[1:], columns=values[0])
 
-# --- 1. CONNECTION ---
-conn = st.connection("gsheets", type=GSheetsConnection)
-
-@st.cache_data(ttl=300)  # Refresh data every 5 minutes
-def load_data():
-    staff = conn.read(worksheet="StaffList")
-    config = conn.read(worksheet="Configuration")
-    leave = conn.read(worksheet="LeaveRequest")
-    return staff, config, leave
+# --- 2. LOAD DATA ---
+# Replace this with your actual Sheet ID from the URL
+SHEET_ID = st.secrets["connections"]["gsheets"]["spreadsheet_id"]
 
 try:
-    staff_df, config_df, leave_df = load_data()
+    staff_df = get_data_from_google(SHEET_ID, "StaffList!A:Z")
+    config_df = get_data_from_google(SHEET_ID, "Configuration!A:Z")
+    leave_df = get_data_from_google(SHEET_ID, "LeaveRequest!A:Z")
+    st.success("Connected via Official Google API!")
 except Exception as e:
-    st.error("Connection Error: Please check your Streamlit Secrets and Google Sheet sharing settings.")
+    st.error(f"Connection failed: {e}")
     st.stop()
 
 # --- 2. SIDEBAR NAVIGATION ---
