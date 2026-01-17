@@ -38,7 +38,7 @@ def generate_medical_roster(month_idx, year, staff_df, leave_df, config_df):
     month_config = config_df[config_df.iloc[:, 0].astype(str).str.strip() == target_month_name]
     
     def parse_csv_cell(df_row, col_idx):
-        if not df_row.empty:
+        if not df_row.empty and len(df_row.columns) > col_idx:
             val = str(df_row.iloc[0, col_idx])
             if val and val != 'nan' and val.strip() != "":
                 return [name.strip() for name in val.split(',')]
@@ -66,6 +66,7 @@ def generate_medical_roster(month_idx, year, staff_df, leave_df, config_df):
     pool_wound = get_eligible('Wound Clinic')
 
     roster_output = []
+    violations = []
     passive_idx = 0
     weekend_groups = {} 
 
@@ -84,56 +85,84 @@ def generate_medical_roster(month_idx, year, staff_df, leave_df, config_df):
 
         row = {
             "Date": day, "Day": day.strftime("%A"),
-            "Is_Special": (is_weekend or is_ph), # Hidden helper for summary
-            "Oncall 1": "SHORTAGE", "Oncall 2": "SHORTAGE", "Oncall 3": "",
+            "Is_Special": (is_weekend or is_ph),
+            "Oncall 1": "", "Oncall 2": "", "Oncall 3": "",
             "Passive": "", "ELOT 1": "", "ELOT 2": "", 
             "Minor OT 1": "", "Minor OT 2": "", "Wound Clinic": ""
         }
 
-        # --- Assignments ---
+        # --- Oncall 1 & 2 ---
         a1, a2 = get_avail(pool_1st), get_avail(pool_2nd)
+        if not a1: violations.append(f"Day {d_num}: No staff available for Oncall 1 (Pool empty or on leave)")
+        if not a2: violations.append(f"Day {d_num}: No staff available for Oncall 2")
+        
         if a1 and a2:
             week_num = day.isocalendar()[1]
             if is_weekend:
                 if week_num not in weekend_groups:
                     random.shuffle(a1); random.shuffle(a2)
                     weekend_groups[week_num] = {'o1': a1[0], 'o2': a2[0]}
-                row["Oncall 1"] = weekend_groups[week_num]['o1'] if weekend_groups[week_num]['o1'] in a1 else a1[0]
-                row["Oncall 2"] = weekend_groups[week_num]['o2'] if weekend_groups[week_num]['o2'] in a2 else a2[0]
+                
+                # Check consistency rule
+                o1_choice = weekend_groups[week_num]['o1']
+                if o1_choice not in a1:
+                    violations.append(f"Day {d_num}: Weekend Continuity Broken for Oncall 1 ({o1_choice} on leave/no-oncall)")
+                    row["Oncall 1"] = a1[0]
+                else:
+                    row["Oncall 1"] = o1_choice
+                
+                o2_choice = weekend_groups[week_num]['o2']
+                if o2_choice not in a2:
+                    violations.append(f"Day {d_num}: Weekend Continuity Broken for Oncall 2 ({o2_choice} on leave/no-oncall)")
+                    row["Oncall 2"] = a2[0]
+                else:
+                    row["Oncall 2"] = o2_choice
             else:
                 row["Oncall 1"], row["Oncall 2"] = random.choice(a1), random.choice(a2)
 
+        # --- Oncall 3 (Weekend/PH) ---
         if is_weekend or is_ph:
             a3 = get_avail(pool_3rd)
             if a3: row["Oncall 3"] = random.choice(a3)
+            else: violations.append(f"Day {d_num}: No staff available for Oncall 3 (Required for Weekend/PH)")
 
+        # --- ELOT ---
         if d_num in elot_days:
             ae = get_avail(pool_elot)
             if is_sat:
                 if ae: row["ELOT 1"] = random.choice(ae)
+                else: violations.append(f"Day {d_num}: Saturday ELOT 1 slot empty")
             else:
                 if len(ae) >= 2:
                     sel = random.sample(ae, 2)
                     row["ELOT 1"], row["ELOT 2"] = sel[0], sel[1]
+                else: violations.append(f"Day {d_num}: Not enough staff for ELOT 1 & 2 (Needed 2, found {len(ae)})")
 
+        # --- Minor OT ---
         if d_num in minor_ot_days:
             am = get_avail(pool_minor)
             if len(am) >= 2:
                 sel = random.sample(am, 2)
                 row["Minor OT 1"], row["Minor OT 2"] = sel[0], sel[1]
+            else: violations.append(f"Day {d_num}: Not enough staff for Minor OT 1 & 2")
 
+        # --- Wound Clinic ---
         if d_num in wound_days:
             aw = get_avail(pool_wound)
             if aw: row["Wound Clinic"] = random.choice(aw)
+            else: violations.append(f"Day {d_num}: Wound Clinic scheduled but no staff available")
 
+        # --- Passive ---
         avail_passive = [s for s in all_staff if s not in absent]
         if avail_passive:
             row["Passive"] = avail_passive[passive_idx % len(avail_passive)]
             passive_idx += 1
+        else:
+            violations.append(f"Day {d_num}: No staff available for Passive duty")
 
         roster_output.append(row)
 
-    return pd.DataFrame(roster_output)
+    return pd.DataFrame(roster_output), violations
 
 # --- 3. UI ---
 st.set_page_config(page_title="MedRoster 2026", layout="wide")
@@ -147,47 +176,34 @@ if staff is not None:
     m_idx = list(calendar.month_name).index(m_name)
     
     if st.button("Generate Roster"):
-        df_final = generate_medical_roster(m_idx, 2026, staff, leave, config)
-        # Drop the hidden helper before showing
+        df_final, rules_broken = generate_medical_roster(m_idx, 2026, staff, leave, config)
+        
         display_df = df_final.drop(columns=["Is_Special"])
         st.dataframe(display_df, use_container_width=True)
         
-        # --- ENHANCED SUMMARY TABLE ---
+        # --- VIOLATIONS SECTION ---
+        st.subheader("⚠️ Rules Broken / Conflict Log")
+        if not rules_broken:
+            st.success("Perfect Roster! No rules were broken.")
+        else:
+            for rule in rules_broken:
+                st.warning(rule)
+
+        # --- SUMMARY TABLE ---
         st.subheader("📊 Duty & Fairness Summary")
-        
         all_names = staff['Staff Name'].dropna().unique()
         summary_data = []
-        
         for name in all_names:
             o1 = (df_final["Oncall 1"] == name).sum()
             o2 = (df_final["Oncall 2"] == name).sum()
             o3 = (df_final["Oncall 3"] == name).sum()
-            
-            # Calculate Weekend/PH Oncalls specifically
             special_days_df = df_final[df_final["Is_Special"] == True]
-            weekend_ph_count = (
-                (special_days_df["Oncall 1"] == name).sum() +
-                (special_days_df["Oncall 2"] == name).sum() +
-                (special_days_df["Oncall 3"] == name).sum()
-            )
-            
-            counts = {
-                "Name": name,
-                "Oncall 1": o1,
-                "Oncall 2": o2,
-                "Oncall 3": o3,
-                "Total Oncall": o1 + o2 + o3,
-                "Total Weekend/PH Oncall": weekend_ph_count,
-                "Passive": (df_final["Passive"] == name).sum(),
-                "ELOT 1": (df_final["ELOT 1"] == name).sum(),
-                "ELOT 2": (df_final["ELOT 2"] == name).sum(),
-                "Minor OT 1": (df_final["Minor OT 1"] == name).sum(),
-                "Minor OT 2": (df_final["Minor OT 2"] == name).sum(),
-                "Wound Clinic": (df_final["Wound Clinic"] == name).sum()
-            }
-            summary_data.append(counts)
-            
+            weekend_ph_count = ((special_days_df["Oncall 1"] == name).sum() + (special_days_df["Oncall 2"] == name).sum() + (special_days_df["Oncall 3"] == name).sum())
+            summary_data.append({
+                "Name": name, "Oncall 1": o1, "Oncall 2": o2, "Oncall 3": o3,
+                "Total Oncall": o1 + o2 + o3, "Total Weekend/PH Oncall": weekend_ph_count,
+                "Passive": (df_final["Passive"] == name).sum(), "ELOT 1": (df_final["ELOT 1"] == name).sum(),
+                "ELOT 2": (df_final["ELOT 2"] == name).sum(), "Minor OT 1": (df_final["Minor OT 1"] == name).sum(),
+                "Minor OT 2": (df_final["Minor OT 2"] == name).sum(), "Wound Clinic": (df_final["Wound Clinic"] == name).sum()
+            })
         st.table(pd.DataFrame(summary_data))
-        
-        csv = display_df.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Roster (CSV)", csv, f"Roster_{m_name}.csv", "text/csv")
