@@ -24,14 +24,35 @@ def get_data_from_google(sheet_id, range_name):
     return pd.DataFrame(values[1:], columns=values[0])
 
 # --- 2. EXECUTION ---
+
+# First, let's check if the secret keys actually exist before we try to use them
+if "connections" not in st.secrets:
+    st.error("❌ 'connections' section missing in Secrets.")
+    st.stop()
+if "gsheets" not in st.secrets["connections"]:
+    st.error("❌ 'gsheets' section missing under connections.")
+    st.stop()
+if "spreadsheet_id" not in st.secrets["connections"]["gsheets"]:
+    st.error("❌ 'spreadsheet_id' key is missing inside gsheets secrets.")
+    st.stop()
+
+# If we pass the checks, then assign the ID
 SHEET_ID = st.secrets["connections"]["gsheets"]["spreadsheet_id"]
 
 try:
+    # Attempt to pull the data
     staff_df = get_data_from_google(SHEET_ID, "StaffList!A:Z")
-    st.success("Successfully found 'spreadsheet_id' and connected!")
-    st.dataframe(staff_df.head())
+    
+    if not staff_df.empty:
+        st.success("✅ Successfully connected to Google Sheets!")
+        st.subheader("Preview of Staff List")
+        st.dataframe(staff_df.head())
+    else:
+        st.warning("Connected, but the StaffList sheet seems to be empty.")
+
 except Exception as e:
-    st.error(f"Logic Error: {e}")
+    st.error(f"⚠️ Connection Error: {e}")
+    st.info("Check: Is the Service Account email added as an 'Editor' on the Google Sheet?")
 
 # --- 2. LOAD DATA ---
 # Replace this with your actual Sheet ID from the URL
