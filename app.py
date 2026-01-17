@@ -22,7 +22,7 @@ def get_data_from_google(sheet_id, range_name):
 
 # --- 2. LOAD DATA ---
 # Replace this with your actual Sheet ID from the URL
-SHEET_ID = st.secrets["connections"]["gsheets"]["1pR3rsSXa9eUmdSylt8_U6_7TEYv7ujk1JisexuB1GUY"]
+SHEET_ID = st.secrets["connections"]["gsheets"]["spreadsheet_id"]
 
 try:
     staff_df = get_data_from_google(SHEET_ID, "StaffList!A:Z")
