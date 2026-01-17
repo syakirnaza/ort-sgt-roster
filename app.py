@@ -16,6 +16,7 @@ def load_all_data(sheet_id):
         config_df = pd.read_csv(get_sheet_url(sheet_id, "Configuration"))
         for df in [staff_df, leave_df, config_df]:
             df.columns = df.columns.astype(str).str.strip()
+            
         def parse_med_date(date_str):
             if pd.isna(date_str) or str(date_str).strip() == "": return None
             try:
@@ -59,8 +60,10 @@ def generate_medical_roster(month_idx, year, staff_df, leave_df, config_df):
     def get_eligible(col):
         return staff_df[staff_df[col].notna()]['Staff Name'].tolist() if col in staff_df.columns else all_staff
 
+    # Pools
     pool_1st, pool_2nd, pool_3rd = get_eligible('1st call'), get_eligible('2nd call'), get_eligible('3rd call')
     pool_elot, pool_minor = get_eligible('ELOT 1'), get_eligible('Minor OT 1')
+    pool_wound = get_eligible('Wound Clinic')
 
     roster_output = []
     passive_idx = 0
@@ -69,23 +72,24 @@ def generate_medical_roster(month_idx, year, staff_df, leave_df, config_df):
     for day in days:
         d_num = day.day
         is_weekend = day.weekday() >= 5
+        is_sat = day.weekday() == 5
         is_ph = d_num in ph_days
         
         daily_leave_row = leave_df[leave_df['Date'] == day]
-        absent = parse_csv_cell(daily_leave_row, 3) # Col D
-        no_oncall = parse_csv_cell(daily_leave_row, 4) # Col E
+        absent = parse_csv_cell(daily_leave_row, 3) 
+        no_oncall = parse_csv_cell(daily_leave_row, 4) 
 
         def get_avail(pool):
             return [s for s in pool if s not in absent and s not in no_oncall]
 
         row = {
             "Date": day, "Day": day.strftime("%A"),
-            "Type": "PH/Weekend" if (is_weekend or is_ph) else "Weekday",
-            "Oncall_1": "SHORTAGE", "Oncall_2": "SHORTAGE", "Oncall_3": "",
-            "Passive": "", "ELOT_1": "", "ELOT_2": "", "Minor_OT_1": "", "Minor_OT_2": ""
+            "Oncall 1": "SHORTAGE", "Oncall 2": "SHORTAGE", "Oncall 3": "",
+            "Passive": "", "ELOT 1": "", "ELOT 2": "", 
+            "Minor OT 1": "", "Minor OT 2": "", "Wound Clinic": ""
         }
 
-        # --- ONCALL 1 & 2 (Always) ---
+        # --- Oncall 1 & 2 ---
         a1, a2 = get_avail(pool_1st), get_avail(pool_2nd)
         if a1 and a2:
             week_num = day.isocalendar()[1]
@@ -93,31 +97,38 @@ def generate_medical_roster(month_idx, year, staff_df, leave_df, config_df):
                 if week_num not in weekend_groups:
                     random.shuffle(a1); random.shuffle(a2)
                     weekend_groups[week_num] = {'o1': a1[0], 'o2': a2[0]}
-                row["Oncall_1"] = weekend_groups[week_num]['o1'] if weekend_groups[week_num]['o1'] in a1 else a1[0]
-                row["Oncall_2"] = weekend_groups[week_num]['o2'] if weekend_groups[week_num]['o2'] in a2 else a2[0]
+                row["Oncall 1"] = weekend_groups[week_num]['o1'] if weekend_groups[week_num]['o1'] in a1 else a1[0]
+                row["Oncall 2"] = weekend_groups[week_num]['o2'] if weekend_groups[week_num]['o2'] in a2 else a2[0]
             else:
-                row["Oncall_1"], row["Oncall_2"] = random.choice(a1), random.choice(a2)
+                row["Oncall 1"], row["Oncall 2"] = random.choice(a1), random.choice(a2)
 
-        # --- ONCALL 3 (Weekend/PH Only) ---
+        # --- Oncall 3 (Weekend/PH) ---
         if is_weekend or is_ph:
             a3 = get_avail(pool_3rd)
-            if a3: row["Oncall_3"] = random.choice(a3)
+            if a3: row["Oncall 3"] = random.choice(a3)
 
-        # --- ELOT (ONLY if specifically in Config) ---
+        # --- ELOT (Saturday vs others) ---
         if d_num in elot_days:
             ae = get_avail(pool_elot)
-            if len(ae) >= 2:
-                sel = random.sample(ae, 2)
-                row["ELOT_1"], row["ELOT_2"] = sel[0], sel[1]
+            if is_sat:
+                if len(ae) >= 1: row["ELOT 1"] = random.choice(ae)
+            else:
+                if len(ae) >= 2:
+                    sel = random.sample(ae, 2)
+                    row["ELOT 1"], row["ELOT 2"] = sel[0], sel[1]
 
-        # --- MINOR OT (ONLY if specifically in Config) ---
+        # --- Minor OT ---
         if d_num in minor_ot_days:
             am = get_avail(pool_minor)
             if len(am) >= 2:
                 sel = random.sample(am, 2)
-                row["Minor_OT_1"], row["Minor_OT_2"] = sel[0], sel[1]
+                row["Minor OT 1"], row["Minor OT 2"] = sel[0], sel[1]
 
-        # --- PASSIVE (Equal Rotation) ---
+        # --- Wound Clinic ---
+        aw = get_avail(pool_wound)
+        if aw: row["Wound Clinic"] = random.choice(aw)
+
+        # --- Passive ---
         avail_passive = [s for s in all_staff if s not in absent]
         if avail_passive:
             row["Passive"] = avail_passive[passive_idx % len(avail_passive)]
@@ -127,7 +138,7 @@ def generate_medical_roster(month_idx, year, staff_df, leave_df, config_df):
 
     return pd.DataFrame(roster_output)
 
-# --- 3. UI (Main) ---
+# --- 3. UI ---
 st.set_page_config(page_title="MedRoster 2026", layout="wide")
 st.title("🏥 Medical Roster Generator 2026")
 
@@ -137,6 +148,28 @@ staff, leave, config = load_all_data(SHEET_ID)
 if staff is not None:
     m_name = st.sidebar.selectbox("Select Month", [m for m in list(calendar.month_name) if m])
     m_idx = list(calendar.month_name).index(m_name)
+    
     if st.button("Generate Roster"):
         df_final = generate_medical_roster(m_idx, 2026, staff, leave, config)
         st.dataframe(df_final, use_container_width=True)
+        
+        # --- SUMMARY TABLE ---
+        st.subheader("📊 Duty Summary (Count per Person)")
+        
+        # List all columns we want to count
+        cols_to_count = ["Oncall 1", "Oncall 2", "Oncall 3", "Passive", "ELOT 1", "ELOT 2", "Minor OT 1", "Minor OT 2", "Wound Clinic"]
+        
+        summary_data = []
+        all_names = staff['Staff Name'].dropna().unique()
+        
+        for name in all_names:
+            counts = {"Name": name}
+            for col in cols_to_count:
+                counts[col] = (df_final[col] == name).sum()
+            summary_data.append(counts)
+            
+        summary_df = pd.DataFrame(summary_data)
+        st.table(summary_df)
+        
+        csv = df_final.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Roster (CSV)", csv, f"Roster_{m_name}.csv", "text/csv")
