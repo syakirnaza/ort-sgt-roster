@@ -1,29 +1,37 @@
 import streamlit as st
 import pandas as pd
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
-# 1. Get the URL from secrets
-# Ensure your secret is: spreadsheet = "https://docs.google.com/spreadsheets/d/YOUR_ID/export?format=csv"
+# --- DEBUG: CHECK IF SECRETS EXIST ---
+if "connections" not in st.secrets or "gsheets" not in st.secrets["connections"]:
+    st.error("Secrets are not configured correctly. Check your [connections.gsheets] header in Streamlit settings.")
+    st.stop()
+
+# --- 1. CONNECTION SETUP ---
+def get_data_from_google(sheet_id, range_name):
+    # This matches the Secrets structure above
+    creds_info = st.secrets["connections"]["gsheets"]
+    creds = service_account.Credentials.from_service_account_info(creds_info)
+    service = build('sheets', 'v4', credentials=creds)
+    
+    sheet = service.spreadsheets()
+    result = sheet.values().get(spreadsheetId=sheet_id, range=range_name).execute()
+    values = result.get('values', [])
+    
+    if not values:
+        return pd.DataFrame()
+    return pd.DataFrame(values[1:], columns=values[0])
+
+# --- 2. EXECUTION ---
+SHEET_ID = st.secrets["connections"]["gsheets"]["spreadsheet_id"]
+
 try:
-    base_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
-    
-    # We append the specific GID for each tab
-    # You find the GID by clicking the tab in your browser and looking at the URL
-    staff_url = f"{base_url}&gid=0"             # Replace 0 with StaffList GID
-    config_url = f"{base_url}&gid=12345678"     # Replace with Configuration GID
-    leave_url = f"{base_url}&gid=87654321"      # Replace with LeaveRequest GID
-
-    @st.cache_data(ttl=600)
-    def load_data(url):
-        return pd.read_csv(url)
-
-    staff_df = load_data(staff_url)
-    config_df = load_data(config_url)
-    leave_df = load_data(leave_url)
-    
-    st.success("Connected to Google Sheets via Direct CSV Stream!")
-
+    staff_df = get_data_from_google(SHEET_ID, "StaffList!A:Z")
+    st.success("Successfully found 'spreadsheet_id' and connected!")
+    st.dataframe(staff_df.head())
 except Exception as e:
-    st.error(f"Error: {e}")
+    st.error(f"Logic Error: {e}")
 
 # --- 2. LOAD DATA ---
 # Replace this with your actual Sheet ID from the URL
