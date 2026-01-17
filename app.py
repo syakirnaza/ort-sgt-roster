@@ -1,209 +1,177 @@
 import streamlit as st
 import pandas as pd
 import calendar
-from datetime import datetime, date
 import random
+import numpy as np
+from datetime import date
 
 # --- 1. DATA LOADING ---
-def get_sheet_url(sheet_id, sheet_name):
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
-
 @st.cache_data(ttl=60)
 def load_all_data(sheet_id):
+    def get_url(name): return f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={name}"
     try:
-        staff_df = pd.read_csv(get_sheet_url(sheet_id, "StaffList"))
-        leave_df = pd.read_csv(get_sheet_url(sheet_id, "LeaveRequest"))
-        config_df = pd.read_csv(get_sheet_url(sheet_id, "Configuration"))
+        staff_df = pd.read_csv(get_url("StaffList"))
+        leave_df = pd.read_csv(get_url("LeaveRequest"))
+        config_df = pd.read_csv(get_url("Configuration"))
         for df in [staff_df, leave_df, config_df]:
             df.columns = df.columns.astype(str).str.strip()
-            
-        def parse_med_date(date_str):
-            if pd.isna(date_str) or str(date_str).strip() == "": return None
-            try:
-                return pd.to_datetime(str(date_str).replace('_', ' ')).date()
-            except:
-                return None
-        leave_df['Date'] = leave_df['Date'].apply(parse_med_date)
+        
+        # Date parsing
+        leave_df['Date'] = pd.to_datetime(leave_df['Date'].astype(str).str.replace('_', ' ')).dt.date
         return staff_df, leave_df.dropna(subset=['Date']), config_df
     except Exception as e:
-        st.error(f"Data Loading Error: {e}")
+        st.error(f"Error loading data: {e}")
         return None, None, None
 
-# --- 2. ROSTER ENGINE ---
-def generate_medical_roster(month_idx, year, staff_df, leave_df, config_df):
+# --- 2. THE SIMULATION ENGINE ---
+def run_simulation(month_idx, year, staff_df, leave_df, config_df):
     num_days = calendar.monthrange(year, month_idx)[1]
     days = [date(year, month_idx, d) for d in range(1, num_days + 1)]
     
-    target_month_name = calendar.month_name[month_idx]
-    month_config = config_df[config_df.iloc[:, 0].astype(str).str.strip() == target_month_name]
+    target_month = calendar.month_name[month_idx]
+    m_config = config_df[config_df.iloc[:, 0].astype(str).str.strip() == target_month]
     
-    def parse_csv_cell(df_row, col_idx):
-        if not df_row.empty and len(df_row.columns) > col_idx:
-            val = str(df_row.iloc[0, col_idx])
-            if val and val != 'nan' and val.strip() != "":
-                return [name.strip() for name in val.split(',')]
-        return []
+    def get_conf(col):
+        if m_config.empty: return []
+        val = str(m_config.iloc[0, col])
+        return [int(x.strip()) for x in val.split(',') if x.strip().isdigit()] if val != 'nan' else []
 
-    def get_config_days(col_idx):
-        if not month_config.empty and len(month_config.columns) > col_idx:
-            val = str(month_config.iloc[0, col_idx])
-            if val and val != 'nan' and val.strip() != "":
-                return [int(x.strip()) for x in val.split(',') if x.strip().isdigit()]
-        return []
-
-    ph_days = get_config_days(1)
-    elot_days = get_config_days(2)
-    minor_ot_days = get_config_days(3)
-    wound_days = get_config_days(4)
-    
+    ph_days, elot_days, minor_days, wound_days = get_conf(1), get_conf(2), get_conf(3), get_conf(4)
     all_staff = staff_df['Staff Name'].dropna().tolist()
     
-    def get_eligible(col):
-        return staff_df[staff_df[col].notna()]['Staff Name'].tolist() if col in staff_df.columns else all_staff
+    def get_pool(col): return staff_df[staff_df[col].notna()]['Staff Name'].tolist() if col in staff_df.columns else all_staff
 
-    pool_1st, pool_2nd, pool_3rd = get_eligible('1st call'), get_eligible('2nd call'), get_eligible('3rd call')
-    pool_elot, pool_minor = get_eligible('ELOT 1'), get_eligible('Minor OT 1')
-    pool_wound = get_eligible('Wound Clinic')
+    pools = {"o1": get_pool('1st call'), "o2": get_pool('2nd call'), "o3": get_pool('3rd call'),
+             "elot": get_pool('ELOT 1'), "minor": get_pool('Minor OT 1'), "wound": get_pool('Wound Clinic')}
 
-    roster_output = []
-    violations = []
-    passive_idx = 0
-    weekend_groups = {} 
+    roster, total_penalties = [], 0
+    passive_idx = random.randint(0, 50)
+    sat_assignments = {"o1": None, "o2": None, "o3": None}
 
     for day in days:
         d_num = day.day
-        is_weekend = day.weekday() >= 5
-        is_sat = day.weekday() == 5
+        is_sat, is_sun = day.weekday() == 5, day.weekday() == 6
         is_ph = d_num in ph_days
+        is_spec = (is_sat or is_sun or is_ph)
         
-        daily_leave_row = leave_df[leave_df['Date'] == day]
-        absent = parse_csv_cell(daily_leave_row, 3) 
-        no_oncall = parse_csv_cell(daily_leave_row, 4) 
+        leave_row = leave_df[leave_df['Date'] == day]
+        absent, restricted = [], []
+        if not leave_row.empty:
+            absent = [n.strip() for n in str(leave_row.iloc[0, 3]).split(',')] if str(leave_row.iloc[0, 3]) != 'nan' else []
+            restricted = [n.strip() for n in str(leave_row.iloc[0, 4]).split(',')] if str(leave_row.iloc[0, 4]) != 'nan' else []
 
-        def get_avail(pool):
-            return [s for s in pool if s not in absent and s not in no_oncall]
+        def get_avail(pool, duty_type):
+            pool = [s for s in pool if s not in absent]
+            # Strict Rule: Col E excluded from Oncalls, Passive, and ELOT
+            if duty_type in ["oncall", "passive", "elot"]:
+                pool = [s for s in pool if s not in restricted]
+            return pool
 
-        row = {
-            "Date": day, "Day": day.strftime("%A"),
-            "Is_Special": (is_weekend or is_ph),
-            "Oncall 1": "", "Oncall 2": "", "Oncall 3": "",
-            "Passive": "", "ELOT 1": "", "ELOT 2": "", 
-            "Minor OT 1": "", "Minor OT 2": "", "Wound Clinic": ""
-        }
+        row = {"Date": day, "Day": day.strftime("%A"), "Is_Spec": is_spec,
+               "Oncall 1": "", "Oncall 2": "", "Oncall 3": "", "Passive": "", 
+               "ELOT 1": "", "ELOT 2": "", "Minor OT 1": "", "Minor OT 2": "", "Wound Clinic": ""}
 
-        # --- Oncall 1 & 2 ---
-        a1, a2 = get_avail(pool_1st), get_avail(pool_2nd)
-        if not a1: violations.append(f"Day {d_num}: No staff available for Oncall 1 (Pool empty or on leave)")
-        if not a2: violations.append(f"Day {d_num}: No staff available for Oncall 2")
-        
-        if a1 and a2:
-            week_num = day.isocalendar()[1]
-            if is_weekend:
-                if week_num not in weekend_groups:
-                    random.shuffle(a1); random.shuffle(a2)
-                    weekend_groups[week_num] = {'o1': a1[0], 'o2': a2[0]}
-                
-                # Check consistency rule
-                o1_choice = weekend_groups[week_num]['o1']
-                if o1_choice not in a1:
-                    violations.append(f"Day {d_num}: Weekend Continuity Broken for Oncall 1 ({o1_choice} on leave/no-oncall)")
-                    row["Oncall 1"] = a1[0]
-                else:
-                    row["Oncall 1"] = o1_choice
-                
-                o2_choice = weekend_groups[week_num]['o2']
-                if o2_choice not in a2:
-                    violations.append(f"Day {d_num}: Weekend Continuity Broken for Oncall 2 ({o2_choice} on leave/no-oncall)")
-                    row["Oncall 2"] = a2[0]
-                else:
-                    row["Oncall 2"] = o2_choice
+        # --- Oncall 1 (Hard Weekend Swap) ---
+        a1 = get_avail(pools["o1"], "oncall")
+        if a1:
+            eligible_o1 = [s for s in a1 if s != sat_assignments["o1"]] if is_sun else a1
+            if not eligible_o1:
+                row["Oncall 1"] = random.choice(a1)
+                total_penalties += 500 # Penalty for repeating O1 on weekend
             else:
-                row["Oncall 1"], row["Oncall 2"] = random.choice(a1), random.choice(a2)
+                row["Oncall 1"] = random.choice(eligible_o1)
+            if is_sat: sat_assignments["o1"] = row["Oncall 1"]
+        else: total_penalties += 1000
 
-        # --- Oncall 3 (Weekend/PH) ---
-        if is_weekend or is_ph:
-            a3 = get_avail(pool_3rd)
-            if a3: row["Oncall 3"] = random.choice(a3)
-            else: violations.append(f"Day {d_num}: No staff available for Oncall 3 (Required for Weekend/PH)")
+        # --- Oncall 2 & 3 (Soft Weekend Swap) ---
+        a2 = get_avail(pools["o2"], "oncall")
+        if a2:
+            eligible_o2 = [s for s in a2 if s != sat_assignments["o2"]] if is_sun else a2
+            row["Oncall 2"] = random.choice(eligible_o2) if eligible_o2 else random.choice(a2)
+            if is_sat: sat_assignments["o2"] = row["Oncall 2"]
+        
+        if is_spec:
+            a3 = get_avail(pools["o3"], "oncall")
+            if a3:
+                eligible_o3 = [s for s in a3 if s != sat_assignments["o3"]] if is_sun else a3
+                row["Oncall 3"] = random.choice(eligible_o3) if eligible_o3 else random.choice(a3)
+                if is_sat: sat_assignments["o3"] = row["Oncall 3"]
 
-        # --- ELOT ---
+        # --- ELOT, Minor OT, Wound (Strict Col E for ELOT only) ---
         if d_num in elot_days:
-            ae = get_avail(pool_elot)
-            if is_sat:
+            ae = get_avail(pools["elot"], "elot")
+            if is_sat: 
                 if ae: row["ELOT 1"] = random.choice(ae)
-                else: violations.append(f"Day {d_num}: Saturday ELOT 1 slot empty")
-            else:
-                if len(ae) >= 2:
-                    sel = random.sample(ae, 2)
-                    row["ELOT 1"], row["ELOT 2"] = sel[0], sel[1]
-                else: violations.append(f"Day {d_num}: Not enough staff for ELOT 1 & 2 (Needed 2, found {len(ae)})")
+            elif len(ae) >= 2: row["ELOT 1"], row["ELOT 2"] = random.sample(ae, 2)
 
-        # --- Minor OT ---
-        if d_num in minor_ot_days:
-            am = get_avail(pool_minor)
-            if len(am) >= 2:
-                sel = random.sample(am, 2)
-                row["Minor OT 1"], row["Minor OT 2"] = sel[0], sel[1]
-            else: violations.append(f"Day {d_num}: Not enough staff for Minor OT 1 & 2")
+        if d_num in minor_days:
+            am = get_avail(pools["minor"], "minor_ot") # Minor OT can take Col E
+            if len(am) >= 2: row["Minor OT 1"], row["Minor OT 2"] = random.sample(am, 2)
 
-        # --- Wound Clinic ---
         if d_num in wound_days:
-            aw = get_avail(pool_wound)
+            aw = get_avail(pools["wound"], "wound") # Wound can take Col E
             if aw: row["Wound Clinic"] = random.choice(aw)
-            else: violations.append(f"Day {d_num}: Wound Clinic scheduled but no staff available")
 
-        # --- Passive ---
-        avail_passive = [s for s in all_staff if s not in absent]
-        if avail_passive:
-            row["Passive"] = avail_passive[passive_idx % len(avail_passive)]
+        # --- Passive (Strict Col E exclusion) ---
+        ap = get_avail(all_staff, "passive")
+        if ap:
+            row["Passive"] = ap[passive_idx % len(ap)]
             passive_idx += 1
-        else:
-            violations.append(f"Day {d_num}: No staff available for Passive duty")
 
-        roster_output.append(row)
+        roster.append(row)
 
-    return pd.DataFrame(roster_output), violations
+    # SCORING
+    df = pd.DataFrame(roster)
+    spec_df = df[df["Is_Spec"] == True]
+    counts = pd.concat([spec_df["Oncall 1"], spec_df["Oncall 2"], spec_df["Oncall 3"]]).value_counts()
+    std_dev = np.std(counts) if not counts.empty else 0
+    total_score = total_penalties + (std_dev * 50)
+    
+    return df, total_score
 
-# --- 3. UI ---
-st.set_page_config(page_title="MedRoster 2026", layout="wide")
-st.title("🏥 Medical Roster Generator 2026")
+# --- 3. THE OPTIMIZER ---
+def optimize_roster(m_idx, year, staff, leave, config, iterations):
+    best_df, best_score = None, float('inf')
+    bar = st.progress(0)
+    status = st.empty()
+    for i in range(1, iterations + 1):
+        df, score = run_simulation(m_idx, year, staff, leave, config)
+        if score < best_score:
+            best_score = score
+            best_df = df
+        if best_score == 0: break # Early Exit on Perfect Roster
+        if i % 500 == 0:
+            bar.progress(i/iterations)
+            status.info(f"Searching... {i}/{iterations} iterations. Best Inequality Score: {best_score:.2f}")
+    return best_df
 
-MY_SHEET_ID = "1pR3rsSXa9eUmdSylt8_U6_7TEYv7ujk1JisexuB1GUY"
-staff, leave, config = load_all_data(MY_SHEET_ID)
+# --- 4. UI ---
+st.set_page_config(page_title="HPC Medical Roster", layout="wide")
+st.title("🏥 AI-Optimized Medical Roster 2026")
+
+SHEET_ID = "1pR3rsSXa9eUmdSylt8_U6_7TEYv7ujk1JisexuB1GUY"
+staff, leave, config = load_all_data(SHEET_ID)
 
 if staff is not None:
-    m_name = st.sidebar.selectbox("Select Month", [m for m in list(calendar.month_name) if m])
+    m_name = st.sidebar.selectbox("Month", [m for m in list(calendar.month_name) if m])
     m_idx = list(calendar.month_name).index(m_name)
-    
-    if st.button("Generate Roster"):
-        df_final, rules_broken = generate_medical_roster(m_idx, 2026, staff, leave, config)
-        
-        display_df = df_final.drop(columns=["Is_Special"])
-        st.dataframe(display_df, use_container_width=True)
-        
-        # --- VIOLATIONS SECTION ---
-        st.subheader("⚠️ Rules Broken / Conflict Log")
-        if not rules_broken:
-            st.success("Perfect Roster! No rules were broken.")
-        else:
-            for rule in rules_broken:
-                st.warning(rule)
+    sims = st.sidebar.select_slider("Optimization Intensity", options=[1000, 10000, 50000], value=10000)
 
-        # --- SUMMARY TABLE ---
+    if st.button("Generate Optimized Roster"):
+        final_df = optimize_roster(m_idx, 2026, staff, leave, config, sims)
+        st.dataframe(final_df.drop(columns=["Is_Spec"]), use_container_width=True)
+
         st.subheader("📊 Duty & Fairness Summary")
-        all_names = staff['Staff Name'].dropna().unique()
-        summary_data = []
-        for name in all_names:
-            o1 = (df_final["Oncall 1"] == name).sum()
-            o2 = (df_final["Oncall 2"] == name).sum()
-            o3 = (df_final["Oncall 3"] == name).sum()
-            special_days_df = df_final[df_final["Is_Special"] == True]
-            weekend_ph_count = ((special_days_df["Oncall 1"] == name).sum() + (special_days_df["Oncall 2"] == name).sum() + (special_days_df["Oncall 3"] == name).sum())
-            summary_data.append({
+        summary = []
+        for name in staff['Staff Name'].dropna().unique():
+            o1, o2, o3 = (final_df["Oncall 1"]==name).sum(), (final_df["Oncall 2"]==name).sum(), (final_df["Oncall 3"]==name).sum()
+            spec = final_df[final_df["Is_Spec"] == True]
+            w_count = (spec["Oncall 1"]==name).sum() + (spec["Oncall 2"]==name).sum() + (spec["Oncall 3"]==name).sum()
+            summary.append({
                 "Name": name, "Oncall 1": o1, "Oncall 2": o2, "Oncall 3": o3,
-                "Total Oncall": o1 + o2 + o3, "Total Weekend/PH Oncall": weekend_ph_count,
-                "Passive": (df_final["Passive"] == name).sum(), "ELOT 1": (df_final["ELOT 1"] == name).sum(),
-                "ELOT 2": (df_final["ELOT 2"] == name).sum(), "Minor OT 1": (df_final["Minor OT 1"] == name).sum(),
-                "Minor OT 2": (df_final["Minor OT 2"] == name).sum(), "Wound Clinic": (df_final["Wound Clinic"] == name).sum()
+                "Total Oncall": o1+o2+o3, "Total Weekend/PH": w_count,
+                "Passive": (final_df["Passive"]==name).sum(), "ELOT 1": (final_df["ELOT 1"]==name).sum(),
+                "ELOT 2": (final_df["ELOT 2"]==name).sum(), "Minor OT 1": (final_df["Minor OT 1"]==name).sum(),
+                "Minor OT 2": (final_df["Minor OT 2"]==name).sum(), "Wound Clinic": (final_df["Wound Clinic"]==name).sum()
             })
-        st.table(pd.DataFrame(summary_data))
+        st.table(pd.DataFrame(summary))
