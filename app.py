@@ -4,34 +4,42 @@ import calendar
 from datetime import datetime
 
 # --- 1. CONFIGURATION & LOADING ---
-st.set_page_config(page_title="Medical Roster 2026", layout="wide")
-SHEET_ID = "1pR3rsSXa9eUmdSylt8_U6_7TEYv7ujk1JisexuB1GUY"
-
-def get_sheet_url(sheet_id, sheet_name):
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
-
 @st.cache_data(ttl=60)
 def load_all_data():
     try:
-        # Load the three tabs
+        # 1. Fetch data from Google Sheets
         staff_df = pd.read_csv(get_sheet_url(SHEET_ID, "StaffList"))
         leave_df = pd.read_csv(get_sheet_url(SHEET_ID, "LeaveRequest"))
         config_df = pd.read_csv(get_sheet_url(SHEET_ID, "Configuration"))
         
-        # Clean headers (strip spaces)
+        # 2. Clean headers
         staff_df.columns = staff_df.columns.str.strip()
         leave_df.columns = leave_df.columns.str.strip()
         config_df.columns = config_df.columns.str.strip()
 
-        # Convert Date columns to actual dates
-        # Note: We use the header 'Date' from your Leave Request tab
-        leave_df['Date'] = pd.to_datetime(leave_df['Date']).dt.date
-        
-        return staff_df, leave_df, config_df
-    except Exception as e:
-        st.error(f"Mapping Error: Could not find header {e}. Please check Sheet names.")
-        return None, None, None
+        # 3. Handle the 'Jan_1_2026' format by replacing underscores with spaces
+        def parse_my_date(date_str):
+            if pd.isna(date_str): return None
+            # Convert "Jan_1_2026" to "Jan 1 2026" so Python can read it
+            clean_str = str(date_str).replace('_', ' ')
+            return pd.to_datetime(clean_str).date()
 
+        # Apply to Leave tab
+        if 'Date' in leave_df.columns:
+            leave_df['Date'] = leave_df['Date'].apply(parse_my_date)
+            leave_df = leave_df.dropna(subset=['Date']) # Remove empty date rows
+            
+        # Apply to PH_Dates in Config tab
+        if 'PH_Dates' in config_df.columns:
+            config_df['PH_Dates'] = config_df['PH_Dates'].apply(parse_my_date)
+            config_df = config_df.dropna(subset=['PH_Dates'])
+
+        return staff_df, leave_df, config_df
+        
+    except Exception as e:
+        # This will now tell us EXACTLY which column or value is failing
+        st.error(f"Mapping Error: {e}")
+        return None, None, None
 # --- 2. ROSTER ENGINE ---
 def generate_roster(month, year, staff_df, leave_df, config_df):
     num_days = calendar.monthrange(year, month)[1]
