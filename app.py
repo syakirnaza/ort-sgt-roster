@@ -3,10 +3,8 @@ import pandas as pd
 import calendar
 from datetime import datetime
 
-# --- 1. CONFIGURATION ---
+# --- 1. CONFIGURATION & LOADING ---
 st.set_page_config(page_title="Medical Roster 2026", layout="wide")
-
-# Replace with your actual Google Sheet ID
 SHEET_ID = "1pR3rsSXa9eUmdSylt8_U6_7TEYv7ujk1JisexuB1GUY"
 
 def get_sheet_url(sheet_id, sheet_name):
@@ -15,81 +13,102 @@ def get_sheet_url(sheet_id, sheet_name):
 @st.cache_data(ttl=60)
 def load_all_data():
     try:
+        # Load the three tabs
         staff_df = pd.read_csv(get_sheet_url(SHEET_ID, "StaffList"))
         leave_df = pd.read_csv(get_sheet_url(SHEET_ID, "LeaveRequest"))
-        # Ensure date columns are actually dates
-        leave_df['Date'] = pd.to_datetime(leave_df['Date']).dt.date
-        return staff_df, leave_df
-    except Exception as e:
-        st.error(f"Error loading data: {e}")
-        return None, None
+        config_df = pd.read_csv(get_sheet_url(SHEET_ID, "Configuration"))
+        
+        # Clean headers (strip spaces)
+        staff_df.columns = staff_df.columns.str.strip()
+        leave_df.columns = leave_df.columns.str.strip()
+        config_df.columns = config_df.columns.str.strip()
 
-# --- 2. ROSTER LOGIC ---
-def generate_roster(month, year, staff_df, leave_df):
+        # Convert Date columns to actual dates
+        # Note: We use the header 'Date' from your Leave Request tab
+        leave_df['Date'] = pd.to_datetime(leave_df['Date']).dt.date
+        
+        return staff_df, leave_df, config_df
+    except Exception as e:
+        st.error(f"Mapping Error: Could not find header {e}. Please check Sheet names.")
+        return None, None, None
+
+# --- 2. ROSTER ENGINE ---
+def generate_roster(month, year, staff_df, leave_df, config_df):
     num_days = calendar.monthrange(year, month)[1]
     days = [datetime(year, month, d).date() for d in range(1, num_days + 1)]
     
-    roster_data = []
-    staff_list = staff_df['Name'].tolist()
+    # Get staff list from your 'Staff Name' column
+    all_staff = staff_df['Staff Name'].dropna().tolist()
     
+    # Extract Public Holidays from Configuration if they exist
+    ph_dates = []
+    if 'PH_Dates' in config_df.columns:
+        ph_dates = pd.to_datetime(config_df['PH_Dates']).dropna().dt.date.tolist()
+
+    roster_results = []
     for i, day in enumerate(days):
-        # 1. Check who is on leave today
-        on_leave = leave_df[leave_df['Date'] == day]['Name'].tolist()
+        # Identify day type
+        is_weekend = day.weekday() >= 5
+        is_ph = day in ph_dates
         
-        # 2. Filter available staff
-        available_staff = [s for s in staff_list if s not in on_leave]
+        # Filter staff on leave or 'No Oncall'
+        # Logic: Check LeaveRequest tab for this date
+        today_leave = leave_df[leave_df['Date'] == day]
+        staff_on_leave = today_leave['Leave'].dropna().tolist() # People with leave marked
+        no_oncall = today_leave[today_leave['Oncall'] == 'No']['Date'].tolist() # People who opted out
+
+        # Available pool
+        available = [s for s in all_staff if s not in staff_on_leave]
         
-        # 3. Simple Rotation Logic (Assigns staff based on index)
-        if available_staff:
-            assigned_staff = available_staff[i % len(available_staff)]
-        else:
-            assigned_staff = "⚠️ SHORTAGE"
-            
-        roster_data.append({
-            "Date": day.strftime("%Y-%m-%d"),
+        # Simple Assignment (Example: Primary On-Call)
+        assigned = available[i % len(available)] if available else "MANPOWER SHORTAGE"
+
+        roster_results.append({
+            "Date": day,
             "Day": day.strftime("%A"),
-            "Assigned Staff": assigned_staff,
-            "On Leave": ", ".join(on_leave) if on_leave else "None"
+            "Status": "PH/Weekend" if (is_weekend or is_ph) else "Normal",
+            "On-Call Staff": assigned,
+            "Leave/Notes": ", ".join(staff_on_leave) if staff_on_leave else ""
         })
     
-    return pd.DataFrame(roster_data)
+    return pd.DataFrame(roster_results)
 
-# --- 3. MAIN INTERFACE ---
-st.title("🏥 Medical Roster System - 2026")
+# --- 3. UI ---
+st.title("🏥 Specialist Roster Generator")
 
-staff, leave = load_all_data()
+staff, leave, config = load_all_data()
 
 if staff is not None:
-    menu = st.sidebar.radio("Menu", ["Staff Overview", "Generate Roster"])
+    # Sidebar mapping
+    st.sidebar.header("Roster Settings")
+    sel_month_name = st.sidebar.selectbox("Month", list(calendar.month_name)[1:])
+    sel_month = list(calendar.month_name).index(sel_month_name)
+    sel_year = st.sidebar.number_input("Year", value=2026)
 
-    if menu == "Staff Overview":
-        st.subheader("📋 Personnel List")
-        st.dataframe(staff, use_container_width=True)
-        
-        st.subheader("🗓️ Logged Leave Requests")
-        st.write(leave)
+    tab1, tab2, tab3 = st.tabs(["View Roster", "Staff Database", "Leave/PH Data"])
 
-    elif menu == "Generate Roster":
-        st.subheader("⚙️ Roster Generator Settings")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            month_name = st.selectbox("Select Month", list(calendar.month_name)[1:])
-            month = list(calendar.month_name).index(month_name)
-        with col2:
-            year = st.number_input("Year", min_value=2026, max_value=2027, value=2026)
+    with tab1:
+        if st.button("Generate Roster"):
+            df_roster = generate_roster(sel_month, sel_year, staff, leave, config)
+            
+            # Highlight Weekends and PH
+            def style_rows(row):
+                if row.Status == "PH/Weekend":
+                    return ['background-color: #ffcccc'] * len(row)
+                return [''] * len(row)
+            
+            st.dataframe(df_roster.style.apply(style_rows, axis=1), use_container_width=True)
+            
+    with tab2:
+        st.subheader("Staff Roles & Capabilities")
+        st.write("Using headers: Staff Name, 1st call, 2nd call, etc.")
+        st.dataframe(staff)
 
-        if st.button("Generate Monthly Roster"):
-            final_roster = generate_roster(month, year, staff, leave)
-            
-            st.success(f"Roster for {month_name} {year} generated!")
-            
-            # Display with coloring for weekends
-            def highlight_weekends(s):
-                return ['background-color: #f0f2f6' if s.Day in ['Saturday', 'Sunday'] else '' for _ in s]
-            
-            st.dataframe(final_roster.style.apply(highlight_weekends, axis=1), use_container_width=True)
-            
-            # Download Button
-            csv = final_roster.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download Roster as CSV", csv, f"roster_{month_name}_{year}.csv", "text/csv")
+    with tab3:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.subheader("Leave Requests")
+            st.dataframe(leave)
+        with col_b:
+            st.subheader("Public Holidays (Configuration)")
+            st.dataframe(config[['PH_Dates']].dropna())
