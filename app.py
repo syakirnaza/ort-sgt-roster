@@ -3,7 +3,7 @@ import pandas as pd
 import calendar
 import random
 import numpy as np
-from datetime import date, timedelta
+from datetime import date
 from multiprocessing import Pool, cpu_count
 
 # --- 1. DATA LOADING ---
@@ -23,20 +23,20 @@ def load_all_data(sheet_id):
         st.error(f"Data Load Error: {e}")
         return None, None, None
 
-# --- 2. THE SIMULATION CORE (WITH SAFETY BLOCKS) ---
+# --- 2. THE SIMULATION CORE ---
 def run_single_simulation(args):
     days, ph_days, elot_days, minor_days, wound_days, all_staff, pools, leave_lookup = args
     roster, total_penalties = [], 0
     weekend_team, prev_sat_o1 = [], None
-    post_call_shield = set() # Doctors who did Oncall yesterday
-    
-    # Random start for passive rotation
+    post_call_shield = set() 
     passive_idx = random.randint(0, 100)
 
     for day in days:
         d_num = day.day
         is_sat, is_sun = day.weekday() == 5, day.weekday() == 6
-        is_spec = (is_sat or is_sun or d_num in ph_days)
+        is_ph = d_num in ph_days
+        is_spec = (is_sat or is_sun or is_ph)
+        
         absent = leave_lookup.get(day, [])
         daily_occupied = set()
         
@@ -46,7 +46,6 @@ def run_single_simulation(args):
 
         def get_avail(pool, duty_type="general"):
             res = [s for s in pool if s not in absent and s not in daily_occupied]
-            # SAFETY RULE: No Oncall if you did Oncall yesterday (Post-Call Rest)
             if duty_type == "oncall":
                 res = [s for s in res if s not in post_call_shield]
             return res
@@ -77,7 +76,7 @@ def run_single_simulation(args):
                     if is_sat and ck == "Oncall 1": prev_sat_o1 = pick
                 else: total_penalties += 5000
 
-        # OTHER DUTIES (Mapping Yes/No)
+        # ELOT, MINOR, WOUND
         if d_num in elot_days:
             ae = get_avail(pools["elot"])
             if len(ae) >= 2: row["ELOT 1"], row["ELOT 2"] = random.sample(ae, 2)
@@ -97,7 +96,6 @@ def run_single_simulation(args):
             row["Passive"] = ap[passive_idx % len(ap)]
             passive_idx += 1
 
-        # Prepare for tomorrow
         post_call_shield = {row["Oncall 1"], row["Oncall 2"], row["Oncall 3"]} - {""}
         roster.append(row)
 
@@ -107,8 +105,8 @@ def run_single_simulation(args):
     return score, df_res
 
 # --- 3. UI & OPTIMIZER ---
-st.set_page_config(page_title="HPC Equality Engine", layout="wide")
-st.title("🏥 Medical Roster: Absolute Equality & Safety Optimizer")
+st.set_page_config(page_title="HPC Optimizer", layout="wide")
+st.title("🏥 Medical Roster: High-Performance Equality Engine")
 
 SHEET_ID = "1pR3rsSXa9eUmdSylt8_U6_7TEYv7ujk1JisexuB1GUY"
 staff, leave, config = load_all_data(SHEET_ID)
@@ -119,7 +117,6 @@ if staff is not None:
     sims = st.sidebar.select_slider("Intensity", options=[1000, 10000, 50000], value=10000)
 
     if st.button("Generate Mathematically Fair Roster"):
-        # Pre-Processing
         target_month = calendar.month_name[m_idx]
         m_cfg = config[config.iloc[:, 0].astype(str) == target_month]
         def get_cfg(i): return [int(x.strip()) for x in str(m_cfg.iloc[0, i]).split(',') if x.strip().isdigit()] if not m_cfg.empty else []
@@ -135,7 +132,6 @@ if staff is not None:
         leave_lkp = {r['Date']: [n.strip() for n in str(r.iloc[3]).split(',')] for _, r in leave.iterrows()}
         args = (days, ph, elot, minor, wound, staff['Staff Name'].tolist(), pools, leave_lkp)
 
-        # Execution with Progress
         best_score, best_df = float('inf'), None
         prog_bar = st.progress(0)
         status = st.empty()
@@ -149,36 +145,45 @@ if staff is not None:
                     best_score, best_df = m_score, m_df
                 percent = (i + 1) * 5
                 prog_bar.progress(percent)
-                status.write(f"**Processing: {percent}%** | Current Best Fairness Score: {best_score:.2f}")
+                status.write(f"**Optimization Progress: {percent}%**")
 
-        # --- DISPLAY RESULTS ---
-        st.success("Roster Generated Successfully!")
+        st.success("Roster Generation Complete!")
         
         # Fairness Meter
         st.subheader("⚖️ Fairness Meter")
-        fairness = max(0, 100 - (best_score / 100))
-        st.progress(fairness / 100)
-        st.write(f"This roster is **{fairness:.1f}%** mathematically optimal.")
+        fair_val = max(0, 100 - (best_score / 200))
+        st.progress(min(100.0, fair_val) / 100)
+        st.write(f"Workload Balance Score: **{fair_val:.1f}%**")
 
-        # Main Dataframe
-        st.dataframe(best_df.drop(columns=["Is_Spec"]), use_container_width=True)
+        # EDITABLE ROSTER
+        st.subheader("✏️ Roster Editor")
+        st.info("You can click any cell to manually swap names. The summary below will update automatically.")
+        # Note: We keep Is_Spec for the summary calculations
+        edited_df = st.data_editor(best_df, use_container_width=True, hide_index=True)
 
-        # --- SUMMARY AUDIT ---
-        st.subheader("📊 Duty Audit Summary")
-        audit = []
-        for n in staff['Staff Name'].dropna().unique():
-            o_tot = (best_df[["Oncall 1", "Oncall 2", "Oncall 3"]] == n).sum().sum()
-            audit.append({"Staff Name": n, "Total Oncalls": o_tot, 
-                          "ELOT": (best_df[["ELOT 1", "ELOT 2"]] == n).sum().sum(),
-                          "Minor OT": (best_df[["Minor OT 1", "Minor OT 2"]] == n).sum().sum()})
-        st.table(pd.DataFrame(audit))
-
-        # --- SHIFT EDITOR ---
+        # --- FINAL SUMMARY AUDIT ---
         st.divider()
-        st.subheader("✏️ Manual Shift Adjuster")
-        st.info("Change a shift below if you need to make a manual swap.")
-        edited_df = st.data_editor(best_df.drop(columns=["Is_Spec"]), num_rows="fixed")
+        st.subheader("📊 Comprehensive Duty Audit")
         
-        if st.button("Save Manual Adjustments"):
-            st.session_state['final_roster'] = edited_df
-            st.write("Changes saved!")
+        summary_list = []
+        for name in staff['Staff Name'].dropna().unique():
+            # Filter for this person
+            o1 = (edited_df["Oncall 1"] == name).sum()
+            o2 = (edited_df["Oncall 2"] == name).sum()
+            o3 = (edited_df["Oncall 3"] == name).sum()
+            
+            # Weekend/PH logic
+            wknd_ph = (edited_df[edited_df["Is_Spec"] == True][["Oncall 1", "Oncall 2", "Oncall 3"]] == name).sum().sum()
+            
+            summary_list.append({
+                "Staff Name": name,
+                "Oncall 1": o1,
+                "Oncall 2": o2,
+                "Oncall 3": o3,
+                "Total Oncall": o1 + o2 + o3,
+                "Weekend/PH": wknd_ph,
+                "Total ELOT": (edited_df[["ELOT 1", "ELOT 2"]] == name).sum().sum(),
+                "Total Minor OT": (edited_df[["Minor OT 1", "Minor OT 2"]] == name).sum().sum()
+            })
+        
+        st.table(pd.DataFrame(summary_list))
