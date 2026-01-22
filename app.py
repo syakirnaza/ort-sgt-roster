@@ -6,7 +6,7 @@ import numpy as np
 from datetime import date
 from multiprocessing import Pool, cpu_count
 
-# --- 1. DATA LOADING (CLEANED) ---
+# --- 1. DATA LOADING ---
 @st.cache_data(ttl=60)
 def load_all_data(sheet_id):
     def get_url(name): return f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={name}"
@@ -15,9 +15,9 @@ def load_all_data(sheet_id):
         leave_df = pd.read_csv(get_url("LeaveRequest"))
         config_df = pd.read_csv(get_url("Configuration"))
         
-        # Trim headers and string data
         for df in [staff_df, leave_df, config_df]:
             df.columns = df.columns.astype(str).str.strip()
+            # Remove whitespace but keep original case for Yes/No matching
             df[:] = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
             
         leave_df['Date'] = pd.to_datetime(leave_df['Date'].astype(str).str.replace('_', ' ')).dt.date
@@ -29,7 +29,6 @@ def load_all_data(sheet_id):
 # --- 2. THE SIMULATION CORE ---
 def run_single_simulation(args):
     days, ph_days, elot_days, all_staff, pools, leave_lookup = args
-    
     roster, total_penalties = [], 0
     weekend_team, prev_sat_o1 = [], None
     post_call_shield = set()
@@ -46,52 +45,41 @@ def run_single_simulation(args):
                "Oncall 1": "", "Oncall 2": "", "Oncall 3": "", "Passive": "", 
                "ELOT 1": "", "ELOT 2": "", "Minor OT 1": "", "Minor OT 2": "", "Wound Clinic": ""}
 
-        def get_avail(pool, duty_type):
-            res = [s for s in pool if s not in absent and s not in daily_occupied]
-            if duty_type == "elot" and not is_sat:
-                res = [s for s in res if s not in post_call_shield]
-            return res
+        def get_avail(pool):
+            return [s for s in pool if s not in absent and s not in daily_occupied]
 
-        # ONCALL LOGIC (With Weekend Team Continuity)
-        if is_sun and len(weekend_team) == 3:
-            sun_pool = [s for s in weekend_team if s not in absent]
-            if len(sun_pool) < 3:
-                total_penalties += 2000
-                sun_pool = get_avail(pools["o1"], "oncall")[:3]
+        # ONCALL 1 & 2
+        for c_name, p_key in [("Oncall 1", "o1"), ("Oncall 2", "o2")]:
+            avail = get_avail(pools[p_key])
+            if is_sun and c_name == "Oncall 1" and prev_sat_o1 in avail and len(avail) > 1:
+                # Rotation: Ensure Sunday O1 is different from Saturday O1
+                avail = [s for s in avail if s != prev_sat_o1]
             
-            random.shuffle(sun_pool)
-            if len(sun_pool) > 1 and sun_pool[0] == prev_sat_o1:
-                sun_pool[0], sun_pool[1] = sun_pool[1], sun_pool[0]
-            
-            for i, c in enumerate(["Oncall 1", "Oncall 2", "Oncall 3"]):
-                if i < len(sun_pool):
-                    row[c] = sun_pool[i]
-                    daily_occupied.add(sun_pool[i])
-        else:
-            if is_sat: weekend_team = []
-            for ck, pk in [("Oncall 1", "o1"), ("Oncall 2", "o2"), ("Oncall 3", "o3")]:
-                if ck == "Oncall 3" and not is_spec: continue
-                avail = get_avail(pools[pk], "oncall")
-                if avail:
-                    pick = random.choice(avail)
-                    row[ck] = pick
-                    daily_occupied.add(pick)
-                    if is_sat:
-                        weekend_team.append(pick)
-                        if ck == "Oncall 1": prev_sat_o1 = pick
-                else: total_penalties += 5000
+            if avail:
+                pick = random.choice(avail)
+                row[c_name] = pick
+                daily_occupied.add(pick)
+                if is_sat and c_name == "Oncall 1": prev_sat_o1 = pick
+            else: total_penalties += 5000
 
-        # PASSIVE (Uses Column E specifically)
-        ap = get_avail(pools["passive"], "passive")
-        if ap:
-            row["Passive"] = ap[passive_idx % len(ap)]
+        # ONCALL 3 (Specials only)
+        if is_spec:
+            avail3 = get_avail(pools["o3"])
+            if avail3:
+                pick3 = random.choice(avail3)
+                row["Oncall 3"] = pick3
+                daily_occupied.add(pick3)
+
+        # PASSIVE (Column E)
+        avail_p = get_avail(pools["passive"])
+        if avail_p:
+            row["Passive"] = avail_p[passive_idx % len(avail_p)]
             passive_idx += 1
             daily_occupied.add(row["Passive"])
 
         post_call_shield = {row["Oncall 1"], row["Oncall 2"], row["Oncall 3"]} - {""}
         roster.append(row)
 
-    # Scoring
     df_temp = pd.DataFrame(roster)
     counts = pd.concat([df_temp["Oncall 1"], df_temp["Oncall 2"], df_temp["Oncall 3"]]).value_counts()
     score = total_penalties + (np.std(counts.values) * 500) if not counts.empty else 999999
@@ -103,16 +91,19 @@ def optimize_parallel(m_idx, year, staff_df, leave_df, config_df, iters):
     days = [date(year, m_idx, d) for d in range(1, num_days + 1)]
     target_month = calendar.month_name[m_idx]
     m_config = config_df[config_df.iloc[:, 0].astype(str).str.strip() == target_month]
-    
     ph_days = [int(x.strip()) for x in str(m_config.iloc[0, 1]).split(',') if x.strip().isdigit()] if not m_config.empty else []
+
+    # --- CRITICAL FIX: MAP "YES" TO NAMES ---
+    def get_names_where_yes(col_name):
+        # Look at the column. If it says 'Yes', get the name from 'Staff Name' column.
+        return staff_df[staff_df[col_name].astype(str).str.lower() == 'yes']['Staff Name'].tolist()
+
     all_staff = staff_df['Staff Name'].dropna().tolist()
-    
-    # Pool Mapping
     pools = {
-        "o1": staff_df['1st call'].dropna().tolist(),
-        "o2": staff_df['2nd call'].dropna().tolist(),
-        "o3": staff_df['3rd call'].dropna().tolist(),
-        "passive": staff_df.iloc[:, 4].dropna().tolist() # Column E is now Passive Pool
+        "o1": get_names_where_yes('1st call'),
+        "o2": get_names_where_yes('2nd call'),
+        "o3": get_names_where_yes('3rd call'),
+        "passive": get_names_where_yes(staff_df.columns[4]) # Column E
     }
     
     leave_lookup = {row['Date']: [n.strip() for n in str(row.iloc[3]).split(',')] for _, row in leave_df.iterrows()}
@@ -137,14 +128,6 @@ if staff is not None:
     sims = st.sidebar.select_slider("Intensity", options=[1000, 10000, 50000], value=10000)
 
     if st.button("Generate Optimized Roster"):
-        with st.spinner(f"Simulating {sims} variations..."):
+        with st.spinner(f"Filtering {sims} variations for fairness..."):
             final_df = optimize_parallel(m_idx, 2026, staff, leave, config, sims)
             st.dataframe(final_df.drop(columns=["Is_Spec"]), use_container_width=True)
-            
-            # Audit
-            st.subheader("📊 Workload Audit")
-            audit = []
-            for n in staff['Staff Name'].dropna().unique():
-                o_tot = (final_df[["Oncall 1", "Oncall 2", "Oncall 3"]] == n).sum().sum()
-                audit.append({"Staff Name": n, "Total Oncalls": o_tot})
-            st.table(pd.DataFrame(audit))
