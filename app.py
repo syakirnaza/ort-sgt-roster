@@ -113,9 +113,20 @@ def run_single_simulation(args):
         post_call_shield = {row["Oncall 1"], row["Oncall 2"], row["Oncall 3"]} - {""}
         roster.append(row)
 
-    counts = pd.concat([pd.DataFrame(roster)[c] for c in ["Oncall 1","Oncall 2","Oncall 3"]]).value_counts()
-    score = total_penalties + (np.std(counts.values)*1000)
-    return score, pd.DataFrame(roster)
+    df_temp = pd.DataFrame(roster)
+    
+    # Calculate balance for Oncalls
+    oncall_counts = pd.concat([df_temp["Oncall 1"], df_temp["Oncall 2"], df_temp["Oncall 3"]]).value_counts()
+    oncall_std = np.std(oncall_counts.values) if not oncall_counts.empty else 100
+    
+    # Calculate balance for ELOT
+    elot_counts = pd.concat([df_temp["ELOT 1"], df_temp["ELOT 2"]]).value_counts()
+    elot_std = np.std(elot_counts.values) if not elot_counts.empty else 0
+    
+    # Total Score: Oncall balance is weighted 5x more than ELOT balance
+    score = total_penalties + (oncall_std * 1000) + (elot_std * 200)
+    
+    return score, df_temp
 
 # --- 3. UI ---
 st.set_page_config(page_title="AI Roster Pro", layout="wide")
