@@ -25,7 +25,7 @@ def load_all_data(sheet_id):
 
 # --- 2. THE SIMULATION CORE ---
 def run_single_simulation(args):
-    days, ph_days, elot_days, minor_days, wound_days, all_staff, pools, leave_data = args
+    days, ph_days, elot_days, minor_days, wound_days, all_staff, pools, leave_data, continuity_mode = args
     roster, total_penalties = [], 0
     post_call_shield = set() 
     weekend_team = []
@@ -124,7 +124,7 @@ def run_single_simulation(args):
                 row["Minor OT 2"] = pm2
                 daily_occupied.add(pm2)
 
-            if d_num in wound_days:
+        if d_num in wound_days:
             aw = get_avail(pools["wound"], "wound")
             if aw: row["Wound Clinic"] = random.choice(aw)
 
@@ -137,7 +137,9 @@ def run_single_simulation(args):
     oc_std = np.std(oc_counts.values) if not oc_counts.empty else 100
     elot_std = np.std(elot_counts.values) if not elot_counts.empty else 100
     
-    score = total_penalties + (oc_std * 1000) + (elot_std * 500)
+    oc_weight = 500 if continuity_mode else 1000 
+    score = total_penalties + (oc_std * oc_weight) + (elot_std * 500)
+    
     return score, df_temp
 
 # --- 3. UI ---
@@ -172,7 +174,7 @@ if staff is not None:
                  "minor1": get_names('Minor OT 1'), "minor2": get_names('Minor OT 2'), "wound": get_names('Wound Clinic')}
         
         days = [date(2026, m_idx, d) for d in range(1, calendar.monthrange(2026, m_idx)[1] + 1)]
-        args = (days, ph, elot, minor, wound, staff['Staff Name'].tolist(), pools, leave_map)
+        args = (days, ph, elot, minor, wound, staff['Staff Name'].tolist(), pools, leave_map, continuity_mode)
 
         prog_bar = st.progress(0)
         with Pool(cpu_count()) as p:
@@ -198,7 +200,7 @@ if staff is not None:
         for i, row in edited_df.iterrows():
             info = st.session_state['leave_lkp'].get(row["Date"], {"absent": [], "restricted": []})
             is_we_ph = row["Date"].weekday() >= 5 or row["Date"].day in ph_list
-            all_slots = ["Oncall 1", "Oncall 2", "Oncall 3", "Passive", "ELOT 1", "ELOT 2", "Minor OT 1", "Minor OT 2", "Wound"]
+            all_slots = ["Oncall 1", "Oncall 2", "Oncall 3", "Passive", "ELOT 1", "ELOT 2", "Minor OT 1", "Minor OT 2", "Wound Clinic"]
             names_on_day = [row[s] for s in all_slots if row[s] and str(row[s]).strip() != ""]
             
             if len(names_on_day) != len(set(names_on_day)):
