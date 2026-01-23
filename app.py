@@ -23,13 +23,14 @@ def load_all_data(sheet_id):
         st.error(f"Data Load Error: {e}")
         return None, None, None
 
-# --- 2. THE SIMULATION CORE (WITH GATEKEEPER LOGIC) ---
+# --- 2. THE SIMULATION CORE ---
 def run_single_simulation(args):
-    days, ph_days, elot_days, minor_days, wound_days, all_staff, pools, leave_lookup = args
+    days, ph_days, elot_days, minor_days, wound_days, all_staff, pools, leave_data = args
     roster, total_penalties = [], 0
     post_call_shield = set() 
     weekend_team = []
     passive_idx = random.randint(0, 100)
+    elot_idx = random.randint(0, 100)
 
     for day in days:
         d_num = day.day
@@ -37,10 +38,12 @@ def run_single_simulation(args):
         is_ph = d_num in ph_days
         is_spec = (is_sat or is_sun or is_ph)
         
-        # requests_today is now a dict: {Name: RequestType}
-        requests_today = leave_lookup.get(day, {}) 
-        daily_occupied = set()
+        # Pull data from leave_data dictionary {Date: {"absent": [], "restricted": []}}
+        day_info = leave_data.get(day, {"absent": [], "restricted": []})
+        absent = day_info["absent"]
+        restricted = day_info["restricted"] # No Oncall/OT people
         
+        daily_occupied = set()
         row = {"Date": day, "Day": day.strftime("%A"), "Is_Spec": is_spec,
                "Oncall 1": "", "Oncall 2": "", "Oncall 3": "", "Passive": "", 
                "ELOT 1": "", "ELOT 2": "", "Minor OT 1": "", "Minor OT 2": "", "Wound Clinic": ""}
@@ -48,27 +51,19 @@ def run_single_simulation(args):
         def get_avail(pool, duty_type):
             res = []
             for s in pool:
-                if s in daily_occupied: continue
+                if s in daily_occupied or s in absent: continue
                 
-                req = str(requests_today.get(s, "")).lower()
-                
-                # RULE 1: Total Absence (AL/Leave/MC)
-                if any(word in req for word in ["leave", "al", "mc"]):
+                # GATEKEEPER: Restricted people can ONLY do Minor OT or Wound Clinic
+                if s in restricted and duty_type in ["oncall", "passive", "elot"]:
                     continue
                 
-                # RULE 2: "No Oncall/OT" Restricted People
-                # They are blocked from Oncall, Passive, and ELOT
-                if "no" in req and duty_type in ["oncall", "passive", "elot"]:
-                    continue
-                
-                # RULE 3: Post-Call Shield for Oncalls
                 if duty_type == "oncall" and s in post_call_shield:
                     continue
-                
                 res.append(s)
             return res
 
-        # --- ONCALL LOGIC ---
+        # --- ALLOCATION ORDER ---
+        # 1. Oncalls
         if is_sun and weekend_team:
             sun_pool = get_avail(weekend_team, "oncall")
             if len(sun_pool) < 3: 
@@ -91,7 +86,7 @@ def run_single_simulation(args):
                     if is_sat: weekend_team.append(pick)
                 else: total_penalties += 5000
 
-        # --- PASSIVE (Weekday Only) ---
+        # 2. Passive & ELOT (Restricted staff excluded)
         if not is_spec:
             ap = get_avail(pools["passive"], "passive")
             if ap:
@@ -99,25 +94,51 @@ def run_single_simulation(args):
                 passive_idx += 1
                 daily_occupied.add(row["Passive"])
 
-        # --- OT DUTIES ---
-        # ELOT (Restricted)
+        # --- 2b. ELOT (Seniority-Aware Round-Robin) ---
         if d_num in elot_days:
-            ae = get_avail(pools["elot"], "elot")
-            if len(ae) >= 2:
-                picks = random.sample(ae, 2)
-                row["ELOT 1"], row["ELOT 2"] = picks[0], picks[1]
-                daily_occupied.update(picks)
-            elif ae: row["ELOT 1"] = ae[0]
+            # 1. Fill ELOT 1 (Seniors Only)
+            ae1 = get_avail(pools["elot1"], "elot")
+            p1 = None
+            if ae1:
+                p1 = ae1[elot_idx % len(ae1)]
+                row["ELOT 1"] = p1
+                daily_occupied.add(p1)
+                # We don't increment elot_idx yet to keep the pairs somewhat stable, 
+                # or you can increment it here—I'll increment at the end.
 
-        # Minor OT (Open to "No" requests)
+            # 2. Fill ELOT 2 (Qualified Staff)
+            ae2 = get_avail(pools["elot2"], "elot")
+            # Crucial: Ensure p1 isn't picked again for ELOT 2
+            ae2_remaining = [s for s in ae2 if s != p1]
+    
+            if ae2_remaining:
+            p2 = ae2_remaining[elot_idx % len(ae2_remaining)]
+            row["ELOT 2"] = p2
+            daily_occupied.add(p2)
+    
+            # Move the pointer forward for the next ELOT day
+            elot_idx += 1
+
+        # 3. Minor OT & Wound Clinic (Restricted staff ALLOWED)
         if d_num in minor_days:
-            am = get_avail(pools["minor"], "minor")
-            if len(am) >= 2:
-                picks = random.sample(am, 2)
-                row["Minor OT 1"], row["Minor OT 2"] = picks[0], picks[1]
-                daily_occupied.update(picks)
+            # 1. Fill Minor OT 1 (Experienced Staff)
+            am1 = get_avail(pools["minor1"], "minor")
+            pm1 = None
+            if am1:
+                # Using a simple random choice or you can use a separate minor_idx for Round Robin
+                pm1 = random.choice(am1)
+                row["Minor OT 1"] = pm1
+                daily_occupied.add(pm1)
 
-        # Wound Clinic (Open to "No" requests)
+            # 2. Fill Minor OT 2 (Qualified Staff)
+            am2 = get_avail(pools["minor2"], "minor")
+            am2_remaining = [s for s in am2 if s != pm1]
+    
+            if am2_remaining:
+                pm2 = random.choice(am2_remaining)
+                row["Minor OT 2"] = pm2
+                daily_occupied.add(pm2)
+
         if d_num in wound_days:
             aw = get_avail(pools["wound"], "wound")
             if aw: row["Wound Clinic"] = random.choice(aw)
@@ -125,18 +146,31 @@ def run_single_simulation(args):
         post_call_shield = {row["Oncall 1"], row["Oncall 2"], row["Oncall 3"]} - {""}
         roster.append(row)
 
+    # Fairness Check
+    # Convert the list of daily rows into a temporary DataFrame for analysis
     df_temp = pd.DataFrame(roster)
-    oncall_counts = pd.concat([df_temp[c] for c in ["Oncall 1", "Oncall 2", "Oncall 3"]]).value_counts()
-    oncall_std = np.std(oncall_counts.values) if not oncall_counts.empty else 100
-    elot_counts = pd.concat([df_temp["ELOT 1"], df_temp["ELOT 2"]]).value_counts()
-    elot_std = np.std(elot_counts.values) if not elot_counts.empty else 0
-    score = total_penalties + (oncall_std * 1000) + (elot_std * 200)
+    
+    # 1. Count Oncalls (High Weight)
+    oc_cols = ["Oncall 1", "Oncall 2", "Oncall 3"]
+    oc_counts = pd.concat([df_temp[c] for c in oc_cols]).value_counts()
+    
+    # 2. Count ELOTs (Medium Weight)
+    elot_cols = ["ELOT 1", "ELOT 2"]
+    elot_counts = pd.concat([df_temp[c] for c in elot_cols]).value_counts()
+    
+    # 3. Calculate Standard Deviation (Spread)
+    # We want both to be even, but we prioritize Oncall balance
+    oc_std = np.std(oc_counts.values) if not oc_counts.empty else 100
+    elot_std = np.std(elot_counts.values) if not elot_counts.empty else 100
+    
+    # Total Score = Penalties + (Oncall Spread * 1000) + (ELOT Spread * 500)
+    score = total_penalties + (oc_std * 1000) + (elot_std * 500)
     
     return score, df_temp
 
-# --- 3. UI & APP LOGIC ---
-st.set_page_config(page_title="HPC AI Roster", layout="wide")
-st.title("🏥 Medical Roster: Group & Gatekeeper Optimizer")
+# --- 3. UI ---
+st.set_page_config(page_title="Roster Generator", layout="wide")
+st.title("🏥 Ortho Segamat Monthly Roster")
 
 SHEET_ID = "1pR3rsSXa9eUmdSylt8_U6_7TEYv7ujk1JisexuB1GUY"
 staff, leave, config = load_all_data(SHEET_ID)
@@ -144,92 +178,176 @@ staff, leave, config = load_all_data(SHEET_ID)
 if staff is not None:
     m_name = st.sidebar.selectbox("Month", [m for m in list(calendar.month_name) if m])
     m_idx = list(calendar.month_name).index(m_name)
-    sims = st.sidebar.select_slider("Intensity", options=[1000, 10000, 50000], value=10000)
+    sims = st.sidebar.slider(
+    "Simulation Intensity", 
+    min_value=1000, 
+    max_value=50000, 
+    value=10000, 
+    step=1000
+    )
 
-    if st.button("Generate Mathematically Fair Roster"):
+    if st.button("Generate Roster"):
         target_month = calendar.month_name[m_idx]
         m_cfg = config[config.iloc[:, 0].astype(str) == target_month]
         def get_cfg(i): return [int(x.strip()) for x in str(m_cfg.iloc[0, i]).split(',') if x.strip().isdigit()] if not m_cfg.empty else []
         ph, elot, minor, wound = get_cfg(1), get_cfg(2), get_cfg(3), get_cfg(4)
         
+        # --- PARSE LEAVE (Col D) AND RESTRICTED (Col E) ---
+        leave_map = {}
+        for _, r in leave.iterrows():
+            d = r['Date']
+            absent_names = [n.strip() for n in str(r.iloc[3]).split(',') if n.strip() and n.strip().lower() != 'nan']
+            restricted_names = [n.strip() for n in str(r.iloc[4]).split(',') if n.strip() and n.strip().lower() != 'nan']
+            leave_map[d] = {"absent": absent_names, "restricted": restricted_names}
+
         def get_names(substring):
             col = [c for c in staff.columns if substring.lower() in c.lower()]
-            if not col: return []
-            return staff[staff[col[0]].astype(str).str.lower() == 'yes']['Staff Name'].tolist()
+            return staff[staff[col[0]].astype(str).str.lower() == 'yes']['Staff Name'].tolist() if col else []
 
         pools = {
-            "o1": get_names('1st call'), "o2": get_names('2nd call'), "o3": get_names('3rd call'),
-            "passive": get_names(staff.columns[4]), 
-            "elot": get_names('ELOT'), "minor": get_names('Minor'), "wound": get_names('Wound')
+            "o1": get_names('1st call'), 
+            "o2": get_names('2nd call'), 
+            "o3": get_names('3rd call'),
+            "passive": get_names('Passive'), 
+            "elot1": get_names('ELOT 1'),  # Senior staff only
+            "elot2": get_names('ELOT 2'),  # Everyone qualified for slot 2
+            "minor1": get_names('Minor 1'), 
+            "minor2": get_names('Minor 2'),
+            "wound": get_names('Wound')
         }
         
         days = [date(2026, m_idx, d) for d in range(1, calendar.monthrange(2026, m_idx)[1] + 1)]
-        
-        # Advanced Leave Lookup: {Date: {Name: Type}}
-        leave_map = {}
-        for _, r in leave.iterrows():
-            d, name, req = r['Date'], str(r.iloc[0]).strip(), str(r.iloc[3]).strip().lower()
-            if d not in leave_map: leave_map[d] = {}
-            leave_map[d][name] = req
-            
         args = (days, ph, elot, minor, wound, staff['Staff Name'].tolist(), pools, leave_map)
 
         prog_bar = st.progress(0)
-        status_text = st.empty()
         with Pool(cpu_count()) as p:
             all_results = []
             for i in range(10):
                 batch = p.map(run_single_simulation, [args] * (sims // 10))
                 all_results.extend(batch)
-                prog_bar.progress((i + 1) * 10)
-                status_text.text(f"Optimizing... {(i+1)*10}%")
+                prog_bar.progress((i+1)*10)
 
-        _, final_roster = min(all_results, key=lambda x: x[0])
+        best_score, final_roster = min(all_results, key=lambda x: x[0])
         st.session_state['active_roster'] = final_roster
         st.session_state['leave_lkp'] = leave_map
+        st.session_state['fairness'] = max(0, 100 - (best_score / 200))
 
     if 'active_roster' in st.session_state:
-        st.subheader("✏️ Manual Shift Adjuster")
+        st.subheader(f"⚖️ Fairness Score: {st.session_state.get('fairness', 0):.1f}%")
+        st.progress(st.session_state.get('fairness', 0) / 100)
+        
         edited_df = st.data_editor(st.session_state['active_roster'], use_container_width=True, hide_index=True, column_config={"Is_Spec": None})
 
-        # --- ENHANCED LIVE VIOLATION SCANNER ---
-        st.subheader("⚠️ Live Rule Violation Alerts")
-        violations = []
-        for i, row in edited_df.iterrows():
-            today_reqs = st.session_state['leave_lkp'].get(row["Date"], {})
+        # --- LIVE VIOLATION SCANNER (RECOMPILED) ---
+st.subheader("⚠️ Rule Violation Alerts")
+violations = []
+
+for i, row in edited_df.iterrows():
+    # 0. Contextual Data
+    current_date = row["Date"]
+    info = st.session_state['leave_lkp'].get(current_date, {"absent": [], "restricted": []})
+    is_weekend_or_ph = current_date.weekday() >= 5 or current_date.day in ph
+    
+    # 1. DOUBLE ENTRY CHECK (Check if same person is in two slots on the same day)
+    all_slots = ["Oncall 1", "Oncall 2", "Oncall 3", "Passive", "ELOT 1", "ELOT 2", "Minor OT 1", "Minor OT 2", "Wound Clinic"]
+    names_on_day = [row[s] for s in all_slots if row[s] and str(row[s]).strip() != ""]
+    
+    if len(names_on_day) != len(set(names_on_day)):
+        dupes = {n for n in names_on_day if names_on_day.count(n) > 1}
+        violations.append(f"Day {current_date.day}: {', '.join(dupes)} assigned to MULTIPLE slots today!")
+
+    # 2. LEAVE & RESTRICTION CHECK (Columns D & E)
+    # Check Heavy Duties
+    for slot in ["Oncall 1", "Oncall 2", "Oncall 3", "Passive", "ELOT 1", "ELOT 2"]:
+        name = row[slot]
+        if name and str(name).strip() != "":
+            if name in info["absent"]:
+                violations.append(f"Day {current_date.day}: {name} is on LEAVE (Col D) but in {slot}!")
+            if name in info["restricted"]:
+                violations.append(f"Day {current_date.day}: {name} is RESTRICTED (Col E) but in {slot}!")
+
+    # Check Light Duties (Only Absent triggers violation)
+    for slot in ["Minor OT 1", "Minor OT 2", "Wound Clinic"]:
+        name = row[slot]
+        if name and str(name).strip() != "" and name in info["absent"]:
+            violations.append(f"Day {current_date.day}: {name} is on LEAVE (Col D) but in {slot}!")
+
+    # 3. SMART POST-CALL CHECK (Weekday vs Weekend logic)
+    if i > 0:
+        prev_on = {edited_df.iloc[i-1][c] for c in ["Oncall 1", "Oncall 2", "Oncall 3"]} - {"", None}
+        curr_on = {row[c] for c in ["Oncall 1", "Oncall 2", "Oncall 3"]} - {"", None}
+        conflict = prev_on.intersection(curr_on)
+        
+        if conflict:
+            # Rule: Post-call is only a violation on Weekdays. 
+            # It is PERMITTED (Prioritized) on Weekends and Public Holidays.
+            if not is_weekend_or_ph:
+                violations.append(f"Day {current_date.day}: {', '.join(conflict)} is on Weekday Post-call (not allowed)!")
+
+# --- DISPLAY RESULTS ---
+if not violations: 
+    st.success("✅ No violations detected. This roster is safe.")
+else:
+    # Display up to 15 violations to keep the UI clean
+    for v in violations[:15]: 
+        st.error(v)
+    if len(violations) > 15:
+        st.warning(f"...and {len(violations)-15} more violations.")
             
-            # Check Restrictions (Oncall, Passive, ELOT)
-            for slot in ["Oncall 1", "Oncall 2", "Oncall 3", "Passive", "ELOT 1", "ELOT 2"]:
-                name = row[slot]
-                if name:
-                    req = today_reqs.get(name, "")
-                    if any(word in req for word in ["leave", "al", "mc"]):
-                        violations.append(f"Day {row['Date'].day}: {name} is on LEAVE but assigned {slot}!")
-                    elif "no" in req:
-                        violations.append(f"Day {row['Date'].day}: {name} has a 'No Oncall/OT' request and cannot do {slot}!")
+        # AUDIT TABLE
+st.subheader("📊 Detailed Duty Audit Summary")
 
-            # Check Minor/Wound for Leave only
-            for slot in ["Minor OT 1", "Minor OT 2", "Wound Clinic"]:
-                name = row[slot]
-                if name and any(word in today_reqs.get(name, "") for word in ["leave", "al", "mc"]):
-                    violations.append(f"Day {row['Date'].day}: {name} is on LEAVE but assigned {slot}!")
+summary = []
+staff_names = staff['Staff Name'].dropna().unique()
 
-            # Post-Call Check
-            if i > 0:
-                prev_on = {edited_df.iloc[i-1][c] for c in ["Oncall 1", "Oncall 2", "Oncall 3"]} - {""}
-                curr_on = {row[c] for c in ["Oncall 1", "Oncall 2", "Oncall 3"]} - {""}
-                conflict = prev_on.intersection(curr_on)
-                if conflict: violations.append(f"Day {row['Date'].day}: {', '.join(conflict)} is on Post-call duty!")
+# 1. Identify Weekend/PH rows
+# We assume 'ph' is your list of public holiday dates
+edited_df['is_weekend_ph'] = edited_df['Date'].apply(
+    lambda x: x.weekday() >= 5 or x.day in ph
+)
 
-        if not violations: st.success("All rules followed.")
-        else:
-            for v in violations[:15]: st.error(v)
+for n in staff_names:
+    # --- ONCALL COUNTS ---
+    o1 = (edited_df["Oncall 1"] == n).sum()
+    o2 = (edited_df["Oncall 2"] == n).sum()
+    o3 = (edited_df["Oncall 3"] == n).sum()
+    passive = (edited_df["Passive"] == n).sum() # Position: Next to Oncall 3
+    
+    # --- TIMING BREAKDOWN ---
+    oncall_cols = ["Oncall 1", "Oncall 2", "Oncall 3"]
+    wd_oncalls = (edited_df[~edited_df['is_weekend_ph']][oncall_cols] == n).sum().sum()
+    we_oncalls = (edited_df[edited_df['is_weekend_ph']][oncall_cols] == n).sum().sum()
+    total_oc = wd_oncalls + we_oncalls # Position: Next to Weekend
+    
+    # --- ELOT & TOTAL ACTIVE ---
+    e1 = (edited_df["ELOT 1"] == n).sum()
+    e2 = (edited_df["ELOT 2"] == n).sum()
+    # Total Active = (O1+O2+O3) + (E1+E2)
+    total_active = total_oc + e1 + e2 # Position: Next to ELOT 2
+    
+    # --- MINOR OT ---
+    m1 = (edited_df["Minor OT 1"] == n).sum()
+    m2 = (edited_df["Minor OT 2"] == n).sum()
 
-        # AUDIT SUMMARY
-        st.subheader("📊 Duty Audit Summary")
-        summary = []
-        for n in staff['Staff Name'].dropna().unique():
-            o1, o2, o3 = (edited_df["Oncall 1"] == n).sum(), (edited_df["Oncall 2"] == n).sum(), (edited_df["Oncall 3"] == n).sum()
-            wknd = (edited_df[edited_df["Is_Spec"] == True][["Oncall 1", "Oncall 2", "Oncall 3"]] == n).sum().sum()
-            summary.append({"Staff Name": n, "O1": o1, "O2": o2, "O3": o3, "Total": o1+o2+o3, "Weekend/PH": wknd, "ELOT": (edited_df[["ELOT 1", "ELOT 2"]] == n).sum().sum(), "Minor OT": (edited_df[["Minor OT 1", "Minor OT 2"]] == n).sum().sum()})
-        st.table(pd.DataFrame(summary))
+    # Define row with columns in the requested sequence
+    summary.append({
+        "Staff Name": n,
+        "Oncall 1": o1,
+        "Oncall 2": o2,
+        "Oncall 3": o3,
+        "Passive": passive,
+        "Oncall (Weekday)": wd_oncalls,
+        "Oncall (W-end/PH)": we_oncalls,
+        "Total Oncall": total_oc,
+        "ELOT 1": e1,
+        "ELOT 2": e2,
+        "Total Active (OC+ELOT)": total_active,
+        "Minor OT 1": m1,
+        "Minor OT 2": m2
+    })
+
+# Convert to DataFrame
+audit_df = pd.DataFrame(summary).sort_values("Staff Name")
+
+# Display the table
+st.table(audit_df)
