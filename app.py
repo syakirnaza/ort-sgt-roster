@@ -102,18 +102,24 @@ def run_single_simulation(args):
 
         # 3. Minor OT & Wound
         if d_num in minor_days:
+            # --- Fill Minor OT 1 ---
             am1 = get_avail(pools["minor1"], "minor")
-            pm1 = random.choice(am1) if am1 else None
-            if pm1:
+            if am1:
+                pm1 = random.choice(am1)
                 row["Minor OT 1"] = pm1
                 daily_occupied.add(pm1)
-            am2 = get_avail(pools["minor2"], "minor")
-            am2_rem = [s for s in am2 if s != pm1]
-            if am2_rem:
-                row["Minor OT 2"] = random.choice(am2_rem)
-                daily_occupied.add(row["Minor OT 2"])
 
-        if d_num in wound_days:
+            # --- Fill Minor OT 2 ---
+            am2 = get_avail(pools["minor2"], "minor")
+            # We filter out pm1 just in case the same person is in both pools
+            am2_remaining = [s for s in am2 if s != row.get("Minor OT 1", "")]
+            
+            if am2_remaining:
+                pm2 = random.choice(am2_remaining)
+                row["Minor OT 2"] = pm2
+                daily_occupied.add(pm2)
+
+            if d_num in wound_days:
             aw = get_avail(pools["wound"], "wound")
             if aw: row["Wound Clinic"] = random.choice(aw)
 
@@ -157,7 +163,7 @@ if staff is not None:
 
         pools = {"o1": get_names('1st call'), "o2": get_names('2nd call'), "o3": get_names('3rd call'),
                  "passive": get_names('Passive'), "elot1": get_names('ELOT 1'), "elot2": get_names('ELOT 2'),
-                 "minor1": get_names('Minor 1'), "minor2": get_names('Minor 2'), "wound": get_names('Wound')}
+                 "minor1": get_names('Minor OT 1'), "minor2": get_names('Minor OT 2'), "wound": get_names('Wound Clinic')}
         
         days = [date(2026, m_idx, d) for d in range(1, calendar.monthrange(2026, m_idx)[1] + 1)]
         args = (days, ph, elot, minor, wound, staff['Staff Name'].tolist(), pools, leave_map)
@@ -186,7 +192,7 @@ if staff is not None:
         for i, row in edited_df.iterrows():
             info = st.session_state['leave_lkp'].get(row["Date"], {"absent": [], "restricted": []})
             is_we_ph = row["Date"].weekday() >= 5 or row["Date"].day in ph_list
-            all_slots = ["Oncall 1", "Oncall 2", "Oncall 3", "Passive", "ELOT 1", "ELOT 2", "Minor OT 1", "Minor OT 2", "Wound Clinic"]
+            all_slots = ["Oncall 1", "Oncall 2", "Oncall 3", "Passive", "ELOT 1", "ELOT 2", "Minor OT 1", "Minor OT 2", "Wound"]
             names_on_day = [row[s] for s in all_slots if row[s] and str(row[s]).strip() != ""]
             
             if len(names_on_day) != len(set(names_on_day)):
